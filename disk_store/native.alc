@@ -1,0 +1,45 @@
+defmodule DiskStoreNative do
+  @moduledoc """
+  The Go functions behind DiskStore. Use DiskStore; this module is how it
+  reaches them.
+  """
+  require "alchem" "v0.3.8"
+
+  extern shared type Log = "*./native.Store"
+
+  struct Entry do
+    key: string
+    value: string
+  end
+
+  struct Choice do
+    value: string
+    keep: boolean
+  end
+
+  extern open(path: string): result[Log, string] = "./native.Open"
+
+  extern close(log: Log): boolean = "./native.Store.Close"
+
+  extern put(log: Log, key: string, value: string): result[tuple[], string] = "./native.Store.Put"
+
+  extern remove(log: Log, key: string): result[tuple[], string] = "./native.Store.Delete"
+
+  extern commit(log: Log, keys: list[string], values: list[string], deletes: list[string]): result[tuple[], string] = "./native.Store.Commit"
+
+  extern update(log: Log, key: string, change: fn[Choice, Choice]): result[Choice, string] = "./native.Store.Update"
+
+  extern compact(log: Log): result[tuple[], string] = "./native.Store.Compact"
+
+  extern get(log: Log, key: string): option[string] = "./native.Store.Get"
+
+  extern has_key(log: Log, key: string): boolean = "./native.Store.HasKey"
+
+  extern keys(log: Log): list[string] = "./native.Store.Keys"
+
+  extern size(log: Log): integer = "./native.Store.Size"
+
+  extern range(log: Log, from: string, to: string): list[Entry] = "./native.Store.Range"
+
+  extern prefix(log: Log, prefix: string): list[Entry] = "./native.Store.Prefix"
+end

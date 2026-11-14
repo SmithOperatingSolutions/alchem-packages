@@ -1,0 +1,67 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # A change to the compiler can break a package without any change here,
+  # so the packages are also tested every night.
+  schedule:
+    - cron: '41 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Actions are pinned to full commit SHAs so a moved tag cannot change what
+# runs here; the trailing comment records the release each SHA belongs to.
+jobs:
+  test:
+    # Every package is tested with the compiler's main branch, which is
+    # where a change that breaks a package shows first. Add a released
+    # version to the list once the packages can be built by it.
+    name: Test (${{ matrix.os }}, Alchem ${{ matrix.alchem }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        alchem: [main]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.x
+          cache: false
+      - name: Install the compiler
+        run: |
+          go install github.com/SmithOperatingSolutions/alchem/cmd/alchem@${{ matrix.alchem }}
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Versions
+        run: |
+          go version
+          alchem version
+      - name: Format
+        run: |
+          alchem fmt --check .
+          test -z "$(gofmt -l .)"
+      - name: Go code
+        run: |
+          for dir in $(find . -name '*.go' -not -path './.git/*' -exec dirname {} \; | sort -u); do
+            go vet "$dir"/*.go
+          done
+      - name: Check
+        run: |
+          for file in $(find . -name '*.alc' -not -name '*_test.alc' -not -path './.git/*' | sort); do
+            echo "$file"
+            alchem check "$file"
+          done
+      - name: Test
+        run: alchem test .

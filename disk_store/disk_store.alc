@@ -1,0 +1,200 @@
+defmodule DiskStore do
+  @moduledoc """
+  Records that outlast the program: text kept under text keys in one file.
+
+  Every change is written through to the disk before the call that made it
+  returns, so a change that was acknowledged survives a crash. Keys and
+  values are also held in memory, keys in order, so reads never touch the
+  disk and a store holds only what fits in memory. A store may be used by
+  any number of processes at once, and one program at a time opens a file.
+
+      alx> path = Path.join(System.tmp_dir!(), "disk_store_doc_" <> Base.encode16(Crypto.strong_rand_bytes(6)))
+      alx> ok(store) = DiskStore.open(path)
+      alx> DiskStore.put(store, "user:1", "ada")
+      ok({})
+      alx> DiskStore.get(store, "user:1")
+      some("ada")
+      alx> DiskStore.close(store)
+      true
+      alx> File.rm(path)
+      ok({})
+  """
+  import "native.alc"
+  require "alchem" "v0.3.8"
+
+  @typedoc """
+  An open store. It can be sent to other processes and kept by servers; it
+  cannot be compared.
+  """
+  struct Store do
+    log: DiskStoreNative.Log
+  end
+
+  @doc """
+  Opens the store in a file, creating the file when there is none. What a
+  crash cut short at the end of the file is dropped. Opening a path that is
+  already open gives the same store. A file that is not a store is
+  error("... is not a store"), and is left as it is.
+  """
+  def open(path: string): result[Store, string] do
+    case DiskStoreNative.open(path) do
+      ok(log) -> ok(%Store{log: log})
+      error(reason) -> error(reason)
+    end
+  end
+
+  @doc """
+  Closes a store once what was waiting is written, and reports whether it
+  was open. A closed store answers writes with error("closed"), and reading
+  it fails.
+  """
+  def close(store: Store): boolean do
+    DiskStoreNative.close(store.log)
+  end
+
+  @doc """
+  Stores a value under a key, replacing what was there. It returns once the
+  change is on the disk.
+  """
+  def put(store: Store, key: string, value: string): result[tuple[], string] do
+    DiskStoreNative.put(store.log, key, value)
+  end
+
+  @doc """
+  Removes a key. Removing a key that is not there is ok.
+  """
+  def delete(store: Store, key: string): result[tuple[], string] do
+    DiskStoreNative.remove(store.log, key)
+  end
+
+  @doc """
+  Makes several changes at once, the deletes and then the puts: all of them
+  are kept or, after a crash, none.
+
+      alx> path = Path.join(System.tmp_dir!(), "disk_store_doc_" <> Base.encode16(Crypto.strong_rand_bytes(6)))
+      alx> ok(store) = DiskStore.open(path)
+      alx> DiskStore.commit(store, [{"a", "1"}, {"b", "2"}], [])
+      ok({})
+      alx> DiskStore.commit(store, [{"c", "3"}], ["a"])
+      ok({})
+      alx> DiskStore.keys(store)
+      ["b", "c"]
+      alx> DiskStore.close(store)
+      true
+      alx> File.rm(path)
+      ok({})
+  """
+  def commit(store: Store, puts: list[tuple[string, string]], deletes: list[string]): result[tuple[], string] do
+    keys = Enum.map(puts, fn {key, _} -> key end)
+    values = Enum.map(puts, fn {_, value} -> value end)
+    DiskStoreNative.commit(store.log, keys, values, deletes)
+  end
+
+  @doc """
+  Changes one key by a function of what it holds, with no other write to
+  the store in between. The function is given some(value) or none, and
+  what it gives is stored, none removing the key. The result is what the
+  function gave.
+
+      alx> path = Path.join(System.tmp_dir!(), "disk_store_doc_" <> Base.encode16(Crypto.strong_rand_bytes(6)))
+      alx> ok(store) = DiskStore.open(path)
+      alx> count = fn(held: option[string]): option[string] do
+      ...>   case held do
+      ...>     some(n) -> some(Integer.to_string(String.to_integer(n) + 1))
+      ...>     none -> some("1")
+      ...>   end
+      ...> end
+      alx> DiskStore.update(store, "visits", count)
+      ok(some("1"))
+      alx> DiskStore.update(store, "visits", count)
+      ok(some("2"))
+      alx> DiskStore.close(store)
+      true
+      alx> File.rm(path)
+      ok({})
+  """
+  def update(store: Store, key: string, change: fn[option[string], option[string]]): result[option[string], string] do
+    outcome = DiskStoreNative.update(store.log, key, fn(held: DiskStoreNative.Choice): DiskStoreNative.Choice do
+      given = if held.keep do
+        some(held.value)
+      else
+        none
+      end
+      case change(given) do
+        some(value) -> %DiskStoreNative.Choice{value: value, keep: true}
+        none -> %DiskStoreNative.Choice{value: "", keep: false}
+      end
+    end)
+    case outcome do
+      ok(left) ->
+        if left.keep do
+          ok(some(left.value))
+        else
+          ok(none)
+        end
+      error(reason) -> error(reason)
+    end
+  end
+
+  @doc """
+  Rewrites the file so that it holds only what is current. A store does
+  this by itself when its file has grown well past what it holds.
+  """
+  def compact(store: Store): result[tuple[], string] do
+    DiskStoreNative.compact(store.log)
+  end
+
+  @doc """
+  The value under a key, or none.
+  """
+  def get(store: Store, key: string): option[string] do
+    DiskStoreNative.get(store.log, key)
+  end
+
+  @doc """
+  Whether a key is present.
+  """
+  def has_key?(store: Store, key: string): boolean do
+    DiskStoreNative.has_key(store.log, key)
+  end
+
+  @doc """
+  Every key, in order.
+  """
+  def keys(store: Store): list[string] do
+    DiskStoreNative.keys(store.log)
+  end
+
+  @doc """
+  How many keys the store holds.
+  """
+  def size(store: Store): integer do
+    DiskStoreNative.size(store.log)
+  end
+
+  @doc """
+  The entries from one key up to, and not including, another, in key order.
+  """
+  def range(store: Store, from: string, to: string): list[tuple[string, string]] do
+    Enum.map(DiskStoreNative.range(store.log, from, to), fn entry -> {entry.key, entry.value} end)
+  end
+
+  @doc """
+  The entries whose keys begin with a prefix, in key order. The empty
+  prefix gives everything.
+
+      alx> path = Path.join(System.tmp_dir!(), "disk_store_doc_" <> Base.encode16(Crypto.strong_rand_bytes(6)))
+      alx> ok(store) = DiskStore.open(path)
+      alx> DiskStore.commit(store, [{"user:2", "bo"}, {"user:1", "al"}, {"page:1", "home"}], [])
+      ok({})
+      alx> DiskStore.prefix(store, "user:")
+      [{"user:1", "al"}, {"user:2", "bo"}]
+      alx> DiskStore.close(store)
+      true
+      alx> File.rm(path)
+      ok({})
+  """
+  def prefix(store: Store, prefix: string): list[tuple[string, string]] do
+    Enum.map(DiskStoreNative.prefix(store.log, prefix), fn entry -> {entry.key, entry.value} end)
+  end
+end

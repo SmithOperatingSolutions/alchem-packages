@@ -1,0 +1,207 @@
+defmodule DiskStoreTest do
+  import "disk_store.alc"
+  doctest DiskStore
+
+  struct Job do
+    store: DiskStore.Store
+    key: string
+  end
+
+  def scratch(): string do
+    Path.join(System.tmp_dir!(), "alchem_store_" <> Base.encode16(Crypto.strong_rand_bytes(8)))
+  end
+
+  def bump(held: option[string]): option[string] do
+    case held do
+      some(n) -> some(Integer.to_string(String.to_integer(n) + 1))
+      none -> some("1")
+    end
+  end
+
+  test "a store keeps what it was given" do
+    path = scratch()
+    ok(store) = DiskStore.open(path)
+    assert(DiskStore.size(store) == 0)
+    assert(DiskStore.put(store, "user:2", "bo") == ok({}))
+    assert(DiskStore.put(store, "user:1", "al") == ok({}))
+    assert(DiskStore.put(store, "user:1", "alice") == ok({}))
+    assert(DiskStore.put(store, "session:9", "") == ok({}))
+    assert(DiskStore.put(store, "", "the empty key") == ok({}))
+    assert(DiskStore.get(store, "user:1") == some("alice"))
+    assert(DiskStore.get(store, "session:9") == some(""))
+    assert(DiskStore.get(store, "user:3") == none)
+    assert(DiskStore.has_key?(store, "session:9"))
+    refute(DiskStore.has_key?(store, "session:8"))
+    assert(DiskStore.keys(store) == ["", "session:9", "user:1", "user:2"])
+    assert(DiskStore.prefix(store, "user:") == [{"user:1", "alice"}, {"user:2", "bo"}])
+    assert(DiskStore.prefix(store, "") |> length() == 4)
+    assert(DiskStore.prefix(store, "v") == [])
+    assert(DiskStore.range(store, "session:", "user:2") == [{"session:9", ""}, {"user:1", "alice"}])
+    assert(DiskStore.range(store, "z", "a") == [])
+    assert(DiskStore.delete(store, "user:2") == ok({}))
+    assert(DiskStore.delete(store, "never there") == ok({}))
+    assert(DiskStore.commit(store, [{"a", "1"}, {"b", "2"}], ["session:9", ""]) == ok({}))
+    assert(DiskStore.commit(store, [], []) == ok({}))
+    assert(DiskStore.update(store, "count", &bump/1) == ok(some("1")))
+    assert(DiskStore.update(store, "count", &bump/1) == ok(some("2")))
+    assert(DiskStore.update(store, "a", fn _ -> none end) == ok(none))
+    assert(DiskStore.update(store, "absent", fn _ -> none end) == ok(none))
+    kept = [{"b", "2"}, {"count", "2"}, {"user:1", "alice"}]
+    assert(DiskStore.prefix(store, "") == kept)
+    # Opening the path again while it is open gives the same store.
+    ok(same) = DiskStore.open(path)
+    assert(DiskStore.put(same, "seen", "by both") == ok({}))
+    assert(DiskStore.get(store, "seen") == some("by both"))
+    assert(DiskStore.delete(store, "seen") == ok({}))
+    assert(DiskStore.close(store))
+    refute(DiskStore.close(store))
+    assert(DiskStore.put(store, "late", "x") == error("closed"))
+    assert(DiskStore.delete(store, "b") == error("closed"))
+    assert(DiskStore.commit(store, [{"late", "x"}], []) == error("closed"))
+    assert(DiskStore.update(store, "late", &bump/1) == error("closed"))
+    assert(DiskStore.compact(store) == error("closed"))
+    assert_raise("DiskStore.get: the store is closed", fn -> DiskStore.get(store, "b") end)
+    assert_raise("DiskStore.keys: the store is closed", fn -> DiskStore.keys(store) end)
+    ok(again) = DiskStore.open(path)
+    assert(DiskStore.prefix(again, "") == kept)
+    assert(DiskStore.compact(again) == ok({}))
+    assert(DiskStore.put(again, "after", "compacting") == ok({}))
+    DiskStore.close(again)
+    ok(third) = DiskStore.open(path)
+    assert(DiskStore.prefix(third, "") == [{"after", "compacting"} | kept])
+    DiskStore.close(third)
+    File.rm(path)
+  end
+
+  test "a store drops what a crash cut short" do
+    path = scratch()
+    ok(store) = DiskStore.open(path)
+    DiskStore.put(store, "first", "1")
+    DiskStore.commit(store, [{"second", "2"}, {"third", "3"}], [])
+    DiskStore.close(store)
+    whole = File.read_binary!(path)
+    # The last record cut anywhere is dropped whole, with both its changes.
+    Enum.each([1, 5, 12], fn cut ->
+      File.write!(path, binary_part(whole, 0, byte_size(whole) - cut))
+      ok(torn) = DiskStore.open(path)
+      assert(DiskStore.keys(torn) == ["first"])
+      DiskStore.close(torn)
+    end)
+    # So is one whose bytes changed, and whatever follows the file's end.
+    File.write!(path, binary_part(whole, 0, byte_size(whole) - 1) <> "X")
+    ok(spoiled) = DiskStore.open(path)
+    assert(DiskStore.keys(spoiled) == ["first"])
+    # What is written next follows the last whole record.
+    assert(DiskStore.put(spoiled, "fourth", "4") == ok({}))
+    DiskStore.close(spoiled)
+    File.write!(path, File.read_binary!(path) <> "trailing")
+    ok(mended) = DiskStore.open(path)
+    assert(DiskStore.prefix(mended, "") == [{"first", "1"}, {"fourth", "4"}])
+    DiskStore.close(mended)
+    # A file cut within its first bytes is a new store; another file is not one.
+    File.write!(path, "ALCHEM")
+    ok(begun) = DiskStore.open(path)
+    assert(DiskStore.size(begun) == 0)
+    assert(DiskStore.put(begun, "k", "v") == ok({}))
+    DiskStore.close(begun)
+    File.write!(path, "name,price\npen,3\n")
+    assert(store_reason(DiskStore.open(path)) == path <> " is not a store")
+    assert(File.read!(path) == "name,price\npen,3\n")
+    File.rm(path)
+    assert(store_reason(DiskStore.open(Path.join(path, "no/such/dir"))) == "enoent")
+  end
+
+  def store_reason(opened: result[DiskStore.Store, string]): string do
+    case opened do
+      ok(_) -> "opened"
+      error(why) -> why
+    end
+  end
+
+  test "many processes write to a store at once" do
+    path = scratch()
+    ok(store) = DiskStore.open(path)
+    tasks = Enum.map(1..20, fn n ->
+      Task.async(fn ->
+        Enum.each(1..10, fn i ->
+          ok(_) = DiskStore.update(store, "count", &bump/1)
+          ok({}) = DiskStore.put(store, "task:" <> Integer.to_string(n) <> ":" <> Integer.to_string(i), "done")
+        end)
+        n
+      end)
+    end)
+    Enum.each(tasks, fn task -> Task.await(task, 30000) end)
+    assert(DiskStore.get(store, "count") == some("200"))
+    assert(length(DiskStore.prefix(store, "task:")) == 200)
+    # More writers than the store queues at once.
+    crowd = Enum.map(1..600, fn n ->
+      Task.async(fn ->
+        ok({}) = DiskStore.put(store, "crowd:" <> Integer.to_string(n), "here")
+        n
+      end)
+    end)
+    Enum.each(crowd, fn task -> Task.await(task, 30000) end)
+    assert(length(DiskStore.prefix(store, "crowd:")) == 600)
+    assert(DiskStore.commit(store, [], Enum.map(DiskStore.prefix(store, "crowd:"), fn {key, _} -> key end)) == ok({}))
+    DiskStore.close(store)
+    ok(again) = DiskStore.open(path)
+    assert(DiskStore.get(again, "count") == some("200"))
+    assert(DiskStore.size(again) == 201)
+    DiskStore.close(again)
+    File.rm(path)
+  end
+
+  test "a store's file does not grow without end" do
+    path = scratch()
+    ok(store) = DiskStore.open(path)
+    large = String.duplicate("x", 300000)
+    Enum.each(1..12, fn n ->
+      ok({}) = DiskStore.put(store, "page", large <> Integer.to_string(n))
+    end)
+    ok(stat) = File.stat(path)
+    assert(stat.size < 2000000)
+    assert(DiskStore.get(store, "page") == some(large <> "12"))
+    DiskStore.close(store)
+    ok(again) = DiskStore.open(path)
+    assert(DiskStore.get(again, "page") == some(large <> "12"))
+    assert(File.exists?(path <> ".compact") == false)
+    DiskStore.close(again)
+    File.rm(path)
+  end
+
+  def worker(inbox: pid[Job], done: pid[boolean]): integer do
+    case Process.receive(inbox, 5000) do
+      {true, job} ->
+        ok({}) = DiskStore.put(job.store, job.key, "sent")
+        Process.send(done, true, 1000)
+        0
+      _ -> 1
+    end
+  end
+
+  test "a store is sent to other processes and kept by a server" do
+    path = scratch()
+    ok(store) = DiskStore.open(path)
+    done: pid[boolean] = Process.self(8)
+    Enum.each(1..4, fn n ->
+      inbox: pid[Job] = Process.spawn(fn(self: pid[Job]): integer do
+        worker(self, done)
+      end, 1)
+      assert(Process.send(inbox, %Job{store: store, key: "job:" <> Integer.to_string(n)}, 1000))
+    end)
+    Enum.each(1..4, fn _ ->
+      assert(Process.receive(done, 5000) == {true, true})
+    end)
+    assert(DiskStore.keys(store) == ["job:1", "job:2", "job:3", "job:4"])
+    agent = Agent.start_link(fn -> store end)
+    assert(Agent.get(agent, fn held -> DiskStore.size(held) end) == 4)
+    # An update whose function fails changes nothing and leaves the store usable.
+    assert_raise("no change", fn ->
+      DiskStore.update(store, "job:1", fn _ -> raise("no change") end)
+    end)
+    assert(DiskStore.get(store, "job:1") == some("sent"))
+    assert(DiskStore.put(store, "after", "failure") == ok({}))
+    DiskStore.close(store)
+    File.rm(path)
+  end
+end
