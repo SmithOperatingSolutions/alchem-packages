@@ -1,0 +1,74 @@
+defmodule VersionTest do
+  import "version.alc"
+  doctest Version
+
+  test "parsing and writing back" do
+    assert(Version.parse("1.0.0-rc.1+build5") == ok(%Version{major: 1, minor: 0, patch: 0, pre: ["rc", "1"], build: some("build5")}))
+    v = Version.parse!("2.3.1")
+    assert({v.major, v.minor, v.patch, v.pre, v.build} == {2, 3, 1, [], none})
+    assert(Version.to_string(v) == "2.3.1")
+    assert(Version.to_string(Version.parse!("1.0.0-rc.1+build5")) == "1.0.0-rc.1+build5")
+    assert(Version.parse("1.2") == error("invalid version \"1.2\""))
+    assert(Version.parse("01.2.3") == error("invalid version \"01.2.3\""))
+    assert(Version.parse("1.2.3-") == error("invalid version \"1.2.3-\""))
+    assert(Version.parse("1.-2.3") == error("invalid version \"1.-2.3\""))
+    assert(Version.parse("1.2.x") == error("invalid version \"1.2.x\""))
+    assert_raise("invalid version", fn -> Version.parse!("v1") end)
+  end
+
+  test "comparing" do
+    assert(Version.compare("1.9.0", "1.10.0") == :lt)
+    assert(Version.compare("1.0.1", "1.0.0") == :gt)
+    assert(Version.compare("3.1.4", "3.1.4+build") == :eq)
+    assert(Version.compare("1.0.0", "1.0.0-rc1") == :gt)
+    assert(Version.compare("1.0.0-rc.2", "1.0.0-rc.1") == :gt)
+    assert(Version.compare("1.0.0-rc.a", "1.0.0-rc.1") == :gt)
+    assert(Version.compare("1.0.0-rc.1.1", "1.0.0-rc.1") == :gt)
+    assert(Version.compare("1.0.0-alpha", "1.0.0-alpha.1") == :lt)
+    assert(Version.compare("1.0.0-beta", "1.0.0-alpha") == :gt)
+    assert(Version.compare("1.0.0-1", "1.0.0-a") == :lt)
+    assert(Version.compare("1.0.0-a.2", "1.0.0-a.10") == :lt)
+    assert(Version.compare("1.0.0-b", "1.0.0-a.1") == :gt)
+    assert(Version.compare(Version.parse!("2.3.1"), Version.parse!("2.10.0")) == :lt)
+    assert_raise("invalid version", fn -> Version.compare("1", "2.0.0") end)
+    assert_raise("invalid version", fn -> Version.compare("1.0.0", "x") end)
+  end
+
+  test "matching requirements" do
+    assert(Version.match?("2.3.1", "~> 2.1"))
+    assert(Version.match?("1.4.0", "~> 1.2.3") == false)
+    assert(Version.match?("1.0.0", "!= 2.0.0 and <= 1.0.0 and > 0.1.0"))
+    assert(Version.match?("0.9.0", ">= 1.0.0 or == 0.9.0"))
+    assert(Version.match?("0.8.0", ">= 1.0.0 or == 0.9.0") == false)
+    assert(Version.match?("0.9.0", "== 0.9.0 or >= 1.0.0 and < 1.0.0"))
+    assert(Version.match?(Version.parse!("2.3.1"), "~> 2.1"))
+    ok(req) = Version.parse_requirement(">= 1.0.0")
+    assert(Version.match?(Version.parse!("1.2.0"), req))
+    assert(Version.match?("2.5.0", Version.parse_requirement!("~> 2.0")))
+    assert(Version.parse_requirement("nonsense") == error("invalid requirement \"nonsense\""))
+    assert_raise("invalid requirement", fn -> Version.parse_requirement!("nonsense") end)
+  end
+
+  test "pre-releases and allow_pre" do
+    assert(Version.match?("2.1.0-rc.1", "~> 2.0", [allow_pre: false]) == false)
+    assert(Version.match?("2.1.0-rc.1", "~> 2.0", [allow_pre: true]))
+    assert(Version.match?("2.1.0-rc.1", "~> 2.1.0-rc.0", [allow_pre: false]))
+    assert(Version.match?("2.1.0", "~> 2.0", [allow_pre: false]))
+    assert_raise("Version.match? takes allow_pre:", fn -> Version.match?("2.1.0", "~> 2.0", [strict: true]) end)
+    assert_raise("invalid requirement", fn -> Version.match?("2.1.0-rc.1", "bogus", [allow_pre: false]) end)
+  end
+
+  test "requirements that are not" do
+    assert_raise("invalid requirement", fn -> Version.match?("1.0.0", "") end)
+    assert_raise("invalid requirement", fn -> Version.match?("1.0.0", ">=") end)
+    assert_raise("invalid requirement", fn -> Version.match?("1.0.0", "~> x") end)
+    assert_raise("invalid requirement", fn -> Version.match?("1.0.0", "~> 1") end)
+    assert_raise("invalid requirement", fn -> Version.match?("1.0.0", "~> 1.x") end)
+    assert_raise("invalid requirement", fn -> Version.match?("1.0.0", "=< 1.0.0") end)
+    assert_raise("invalid requirement", fn -> Version.match?("1.0.0", "== 1.0") end)
+    assert_raise("invalid requirement", fn -> Version.match?("1.0.0", "== 1.x") end)
+    assert_raise("invalid requirement", fn -> Version.match?("1.0.0", ">= 1.0.0 and") end)
+    assert_raise("invalid requirement", fn -> Version.match?("1.0.0", ">= 1.0.0 maybe") end)
+    assert_raise("invalid version", fn -> Version.match?("1.0", ">= 1.0.0") end)
+  end
+end

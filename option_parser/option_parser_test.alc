@@ -1,0 +1,50 @@
+defmodule OptionParserTest do
+  import "option_parser.alc"
+  doctest OptionParser
+
+  test "switches given by a map" do
+    {values, rest, invalid} = OptionParser.parse(["--n=3", "--b=maybe", "--s", "--x", "-q", "--f", "nan?", "--n"], %{"n" => "integer", "b" => "boolean", "s" => "string", "f" => "float"})
+    assert(values == %{"n" => "3", "s" => "--x"})
+    assert(rest == [])
+    assert(invalid == [{"--b", "maybe"}, {"-q", ""}, {"--f", "nan?"}, {"--n", ""}])
+    {counted, _, _} = OptionParser.parse(["-v", "-v", "--no-quiet"], %{"verbose" => "count", "quiet" => "boolean"}, %{"v" => "verbose"})
+    assert(counted == %{"quiet" => "false", "verbose" => "2"})
+    {found, others, bad} = OptionParser.parse(["--x=1", "-y", "--no-flag", "--flag=yes", "--n", "z", "--", "-p"], %{"x" => "integer", "flag" => "boolean", "n" => "integer"}, %{"y" => "x"})
+    assert(found == %{"x" => "1"})
+    assert(others == ["-p"])
+    assert(bad == [{"-y", "--no-flag"}, {"--flag", "yes"}, {"--n", "z"}])
+    assert_raise("the type of switch \"a\" is boolean, string, integer, float or count, not \"list\"", fn -> OptionParser.parse([], %{"a" => "list"}) end)
+  end
+
+  test "switches given as Elixir gives them" do
+    switches = [
+      strict: [count: :integer, ratio: :float, verbose: :boolean, name: :string],
+      aliases: [c: :count]
+    ]
+    {parsed, rest, invalid} = OptionParser.parse(["--count", "x", "--ratio=0.5", "--no-verbose", "-c", "3", "-z", "--name", "--", "tail"], switches)
+    assert(parsed == [ratio: "0.5", verbose: "false", count: "3", name: "--"])
+    assert(rest == ["tail"])
+    assert(invalid == [{"--count", some("x")}, {"-z", none}])
+    {_, _, missing} = OptionParser.parse(["--name"], switches)
+    assert(missing == [{"--name", none}])
+    {_, _, wrong} = OptionParser.parse(["--verbose=maybe", "--ratio", "x"], switches)
+    assert(wrong == [{"--verbose", some("maybe")}, {"--ratio", some("x")}])
+    {loose, _, _} = OptionParser.parse(["--free=1", "--flag"], [switches: []])
+    assert(loose == [free: "1", flag: "true"])
+    assert(OptionParser.parse(["--x", "1", "--flag", "rest"], [switches: [x: :integer]]) == {[x: "1", flag: "rest"], [], []})
+    argv = ["--name", "ada", "-v", "--tag", "a", "--tag", "b", "-v", "file.txt", "--bogus"]
+    assert(OptionParser.parse(argv, [strict: [name: :string, verbose: :count, tag: :keep], aliases: [v: :verbose]]) == {[name: "ada", tag: "a", tag: "b", verbose: "2"], ["file.txt"], [{"--bogus", none}]})
+    assert_raise("not both", fn -> OptionParser.parse([], [strict: [], switches: []]) end)
+    assert_raise("the type of :a is", fn -> OptionParser.parse([], [strict: [a: :list]]) end)
+    assert_raise("OptionParser.parse takes strict:, switches: and aliases:", fn -> OptionParser.parse([], [other: []]) end)
+  end
+
+  test "stopping at a command, writing back and splitting" do
+    assert(OptionParser.parse_head(["--x", "1", "cmd", "--y"], [strict: [x: :integer]]) == {[x: "1"], ["cmd", "--y"], []})
+    assert(OptionParser.to_argv([name: "ada", debug: "true", color: "false", dry_run: "true"]) == ["--name", "ada", "--debug", "--no-color", "--dry-run"])
+    assert(OptionParser.split("a 'b c' \"d e\" f\\ g") == ["a", "b c", "d e", "f g"])
+    assert(OptionParser.split("  spaced\tout\n'' ") == ["spaced", "out", ""])
+    assert(OptionParser.split("'a\\b' \"it's\" é") == ["a\\b", "it's", "é"])
+    assert(OptionParser.split("") == [])
+  end
+end

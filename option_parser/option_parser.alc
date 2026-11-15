@@ -1,0 +1,328 @@
+defmodule OptionParser do
+  @moduledoc """
+  Reads switches from command-line arguments, such as those of
+  System.argv(): --name value, --name=value, --flag, --no-flag and short
+  aliases such as -v.
+  """
+  require "alchem" "v0.3.10"
+
+  # How arguments are read: the type of each switch, the long name of each
+  # short one, whether a switch that is not listed is invalid, and whether
+  # reading stops at the first argument that is not a switch.
+  struct Rules do
+    types: map[string, string]
+    aliases: map[string, string]
+    strict: boolean
+    head: boolean
+  end
+
+  # A switch that was read, and one that could not be.
+  struct Found do
+    name: string
+    value: string
+  end
+
+  struct Invalid do
+    written: string
+    value: string
+    valued: boolean
+  end
+
+  struct Read do
+    found: list[Found]
+    rest: list[string]
+    invalid: list[Invalid]
+  end
+
+  @doc """
+  Reads switches from arguments.
+
+  Given a map of each switch's type ("boolean", "string", "integer",
+  "float" or "count") and optionally a map of short letters to names, it
+  returns the values as text by name, the arguments that are not switches,
+  and the switches that are unknown or have a value of the wrong type.
+
+      alx> {options, files, invalid} = OptionParser.parse(["--verbose", "--jobs=4", "a.txt", "--dry-run", "--color", "red", "b.txt"], %{"verbose" => "boolean", "jobs" => "integer", "dry_run" => "boolean"})
+      alx> options
+      %{"dry_run" => "true", "jobs" => "4", "verbose" => "true"}
+      alx> files
+      ["a.txt", "red", "b.txt"]
+      alx> invalid
+      [{"--color", ""}]
+      alx> {short, _, _} = OptionParser.parse(["-v", "-v", "--no-color", "-n", "x"], %{"verbose" => "count", "color" => "boolean", "name" => "string"}, %{"v" => "verbose", "n" => "name"})
+      alx> short
+      %{"color" => "false", "name" => "x", "verbose" => "2"}
+
+  Given options as Elixir takes them, strict: or switches: (a keyword list
+  of name: type, the types being :boolean, :string, :integer, :float, :count
+  and :keep) and aliases: (letter: name), it returns the switches as a
+  keyword list of their values as text, in order. Under strict: a switch
+  that is not listed is invalid; under switches: it is kept, as a string,
+  or as a boolean when no value follows.
+
+      alx> OptionParser.parse(["--name", "ada", "-v", "file", "--odd"], [strict: [name: :string, verbose: :boolean], aliases: [v: :verbose]])
+      {[name: "ada", verbose: "true"], ["file"], [{"--odd", none}]}
+      alx> OptionParser.parse(["--tag", "a", "--tag", "b", "--loose", "x"], [switches: [tag: :keep]])
+      {[tag: "a", tag: "b", loose: "x"], [], []}
+  """
+  def parse(arguments: list[string], switches: map[string, string]): tuple[map[string, string], list[string], list[tuple[string, string]]] do
+    parse(arguments, switches, %{})
+  end
+
+  def parse(arguments: list[string], options: list[tuple[atom, list[tuple[atom, atom]]]]): tuple[list[tuple[atom, string]], list[string], list[tuple[string, option[string]]]] do
+    keyword(arguments, options, false)
+  end
+
+  def parse(arguments: list[string], switches: map[string, string], aliases: map[string, string]): tuple[map[string, string], list[string], list[tuple[string, string]]] do
+    Enum.each(switches, fn entry ->
+      if not Enum.member?(["boolean", "string", "integer", "float", "count"], elem(entry, 1)) do
+        raise("the type of switch " <> inspect(elem(entry, 0)) <> " is boolean, string, integer, float or count, not " <> inspect(elem(entry, 1)))
+      end
+    end)
+    read = scan(%Rules{types: switches, aliases: aliases, strict: true, head: false}, arguments, %Read{found: [], rest: [], invalid: []})
+    empty: map[string, string] = %{}
+    values = Enum.reduce(Enum.reverse(read.found), empty, fn found, values -> Map.put(values, found.name, found.value) end)
+    {values, Enum.reverse(read.rest), Enum.map(Enum.reverse(read.invalid), fn invalid -> {invalid.written, invalid.value} end)}
+  end
+
+  @doc """
+  Like OptionParser.parse with Elixir's options, stopping at the first
+  argument that is not a switch: what follows a command belongs to the
+  command.
+
+      alx> OptionParser.parse_head(["--x", "1", "cmd", "--y"], [strict: [x: :integer]])
+      {[x: "1"], ["cmd", "--y"], []}
+  """
+  def parse_head(arguments: list[string], options: list[tuple[atom, list[tuple[atom, atom]]]]): tuple[list[tuple[atom, string]], list[string], list[tuple[string, option[string]]]] do
+    keyword(arguments, options, true)
+  end
+
+  @doc """
+  Writes switches back as command-line arguments: name: value as --name
+  value, and a boolean as --name or --no-name.
+
+      alx> OptionParser.to_argv([name: "ada", debug: "true", color: "false"])
+      ["--name", "ada", "--debug", "--no-color"]
+  """
+  def to_argv(options: list[tuple[atom, string]]): list[string] do
+    Enum.flat_map(options, fn option ->
+      name = String.replace(Atom.to_string(elem(option, 0)), "_", "-")
+      case elem(option, 1) do
+        "true" -> ["--" <> name]
+        "false" -> ["--no-" <> name]
+        value -> ["--" <> name, value]
+      end
+    end)
+  end
+
+  @doc ~S"""
+  Splits a command line into arguments as a shell does: at spaces outside
+  quotes, with backslash escapes.
+
+      alx> OptionParser.split("a 'b c' \"d e\"")
+      ["a", "b c", "d e"]
+  """
+  def split(line: string): list[string] do
+    pieces(line, 0, "", "", false, [])
+  end
+
+  # Reads a line byte by byte: current is the argument so far, quote the
+  # quote it is inside, and started whether there is an argument at all.
+  defp pieces(line: string, at: integer, current: string, quote: string, started: boolean, out: list[string]): list[string] do
+    if at >= byte_size(line) do
+      Enum.reverse(if started do
+        [current | out]
+      else
+        out
+      end)
+    else
+      ch = binary_part(line, at, 1)
+      cond do
+        ch == "\\" and at + 1 < byte_size(line) and quote != "'" ->
+          pieces(line, at + 2, current <> binary_part(line, at + 1, 1), quote, true, out)
+        quote != "" and ch == quote -> pieces(line, at + 1, current, "", started, out)
+        quote == "" and (ch == "\"" or ch == "'") -> pieces(line, at + 1, current, ch, true, out)
+        quote == "" and (ch == " " or ch == "\t" or ch == "\n") ->
+          if started do
+            pieces(line, at + 1, "", "", false, [current | out])
+          else
+            pieces(line, at + 1, current, quote, started, out)
+          end
+        true -> pieces(line, at + 1, current <> ch, quote, true, out)
+      end
+    end
+  end
+
+  defp keyword(arguments: list[string], options: list[tuple[atom, list[tuple[atom, atom]]]], head: boolean): tuple[list[tuple[atom, string]], list[string], list[tuple[string, option[string]]]] do
+    rules = Enum.reduce(options, {%Rules{types: %{}, aliases: %{}, strict: false, head: head}, false}, fn option, state ->
+      {rules, given} = state
+      {name, entries} = option
+      cond do
+        name == :strict or name == :switches ->
+          if given do
+            raise("OptionParser.parse takes strict: or switches:, not both")
+          end
+          types = Enum.reduce(entries, rules.types, fn entry, types ->
+            kind = Atom.to_string(elem(entry, 1))
+            if not Enum.member?(["boolean", "string", "integer", "float", "count", "keep"], kind) do
+              raise("the type of :" <> Atom.to_string(elem(entry, 0)) <> " is :boolean, :string, :integer, :float, :count or :keep")
+            end
+            Map.put(types, Atom.to_string(elem(entry, 0)), kind)
+          end)
+          {%Rules{rules | types: types, strict: name == :strict}, true}
+        name == :aliases ->
+          aliases = Enum.reduce(entries, rules.aliases, fn entry, aliases ->
+            Map.put(aliases, Atom.to_string(elem(entry, 0)), Atom.to_string(elem(entry, 1)))
+          end)
+          {%Rules{rules | aliases: aliases}, given}
+        true -> raise("OptionParser.parse takes strict:, switches: and aliases:")
+      end
+    end)
+    {settled, _} = rules
+    read = scan(settled, arguments, %Read{found: [], rest: [], invalid: []})
+    # A switch given again replaces what it had, unless it keeps them all.
+    nothing: list[tuple[string, string]] = []
+    parsed = Enum.reduce(Enum.reverse(read.found), nothing, fn found, parsed ->
+      kept = if Map.get(settled.types, found.name, "") == "keep" do
+        parsed
+      else
+        Enum.reject(parsed, fn earlier -> elem(earlier, 0) == found.name end)
+      end
+      kept ++ [{found.name, found.value}]
+    end)
+    invalid = Enum.map(Enum.reverse(read.invalid), fn invalid ->
+      {invalid.written, if invalid.valued do
+        some(invalid.value)
+      else
+        none
+      end}
+    end)
+    {Enum.map(parsed, fn entry -> {String.to_atom(elem(entry, 0)), elem(entry, 1)} end), Enum.reverse(read.rest), invalid}
+  end
+
+  # Splits text at the first separator: what is before it, what is after,
+  # and whether it was there.
+  defp cut(text: string, separator: string): tuple[string, string, boolean] do
+    case String.split(text, separator) do
+      [first, second | rest] -> {first, Enum.join([second | rest], separator), true}
+      _ -> {text, "", false}
+    end
+  end
+
+  defp bad(read: Read, written: string, value: string, valued: boolean): Read do
+    %Read{read | invalid: [%Invalid{written: written, value: value, valued: valued} | read.invalid]}
+  end
+
+  defp set(read: Read, name: string, value: string): Read do
+    %Read{read | found: [%Found{name: name, value: value} | read.found]}
+  end
+
+  # Reads the arguments in turn. What is read is kept newest first.
+  defp scan(rules: Rules, arguments: list[string], read: Read): Read do
+    case arguments do
+      [] -> read
+      ["--" | rest] -> %Read{read | rest: Enum.reverse(rest) ++ read.rest}
+      [argument | rest] ->
+        if not String.starts_with?(argument, "-") or argument == "-" do
+          if rules.head do
+            %Read{read | rest: Enum.reverse(arguments) ++ read.rest}
+          else
+            scan(rules, rest, %Read{read | rest: [argument | read.rest]})
+          end
+        else
+          switch(rules, argument, rest, read)
+        end
+    end
+  end
+
+  # Reads one switch, and its value when that is the next argument.
+  defp switch(rules: Rules, argument: string, rest: list[string], read: Read): Read do
+    {written, attached, valued} = cut(argument, "=")
+    plain = String.replace(String.trim_leading(written, "-"), "-", "_")
+    long = if String.starts_with?(written, "--") do
+      some(plain)
+    else
+      Map.get(rules.aliases, plain)
+    end
+    case long do
+      none -> scan(rules, rest, bad(read, written, attached, valued))
+      some(name) ->
+        positive = if String.starts_with?(name, "no_") do
+          binary_part(name, 3, byte_size(name) - 3)
+        else
+          ""
+        end
+        follows = case rest do
+          [next | _] -> not String.starts_with?(next, "-")
+          [] -> false
+        end
+        cond do
+          Map.has_key?(rules.types, name) ->
+            typed(rules, name, Map.get(rules.types, name, ""), false, written, attached, valued, rest, read)
+          positive != "" and Map.get(rules.types, positive, "") == "boolean" ->
+            typed(rules, positive, "boolean", true, written, attached, valued, rest, read)
+          rules.strict -> scan(rules, rest, bad(read, written, attached, valued))
+          # Without strict, a switch that is not listed takes the next
+          # argument as its value when that is not a switch, and is true
+          # otherwise.
+          valued or follows ->
+            typed(rules, name, "string", false, written, attached, valued, rest, read)
+          true -> typed(rules, name, "boolean", false, written, attached, valued, rest, read)
+        end
+    end
+  end
+
+  defp typed(rules: Rules, name: string, kind: string, negated: boolean, written: string, attached: string, valued: boolean, rest: list[string], read: Read): Read do
+    cond do
+      kind == "boolean" and valued and attached != "true" and attached != "false" ->
+        scan(rules, rest, bad(read, written, attached, true))
+      kind == "boolean" and valued -> scan(rules, rest, set(read, name, attached))
+      kind == "boolean" and negated -> scan(rules, rest, set(read, name, "false"))
+      kind == "boolean" -> scan(rules, rest, set(read, name, "true"))
+      kind == "count" ->
+        seen = case Enum.find(read.found, fn found -> found.name == name end) do
+          some(found) ->
+            case Integer.parse(found.value) do
+              ok(n) -> n
+              error(_) -> 0
+            end
+          none -> 0
+        end
+        scan(rules, rest, set(read, name, Integer.to_string(seen + 1)))
+      valued -> valued(rules, name, kind, written, attached, rest, read)
+      true ->
+        # The value is the next argument.
+        case rest do
+          [] -> scan(rules, rest, bad(read, written, "", false))
+          [value | after_value] -> valued(rules, name, kind, written, value, after_value, read)
+        end
+    end
+  end
+
+  defp valued(rules: Rules, name: string, kind: string, written: string, value: string, rest: list[string], read: Read): Read do
+    fits = case kind do
+      "integer" -> is_integer_text(value)
+      "float" -> is_float_text(value)
+      _ -> true
+    end
+    if fits do
+      scan(rules, rest, set(read, name, value))
+    else
+      scan(rules, rest, bad(read, written, value, true))
+    end
+  end
+
+  defp is_integer_text(value: string): boolean do
+    case Integer.parse(value) do
+      ok(_) -> true
+      error(_) -> false
+    end
+  end
+
+  defp is_float_text(value: string): boolean do
+    case Float.parse(value) do
+      ok(_) -> true
+      error(_) -> false
+    end
+  end
+end

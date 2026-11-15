@@ -1,0 +1,466 @@
+defmodule WebSocket do
+  @moduledoc """
+  WebSockets, RFC 6455: a handler of HTTP.serve upgrades its request into a
+  socket, and WebSocket.connect opens one to a server. Messages are text or
+  binary; pings and the closing handshake are answered while the socket is
+  being read. Calls that wait take milliseconds and give error("timeout") or
+  error("closed").
+
+  A socket belongs to the process that made it, and its connection is
+  dropped when that process ends. It can be sent to other processes and kept
+  by servers; one process reads it at a time.
+  """
+  import "native.alc"
+  require "alchem" "v0.3.10"
+
+  # How long one read of the connection waits: a process closing a socket
+  # that another is reading waits no longer than this for its turn.
+  @slice 100
+
+  @typedoc """
+  What a socket gives: a text or binary message, the closing handshake with
+  its code and reason, or a failure that ended it.
+  """
+  type Event do
+    text(text: string)
+    binary(data: string)
+    closed(code: integer, reason: string)
+    error(reason: string)
+  end
+
+  @typedoc """
+  An open WebSocket. It can be sent to other processes and kept by servers;
+  it cannot be compared.
+  """
+  struct Socket do
+    conn: socket
+    protocol: WebSocketNative.Protocol
+  end
+
+  @doc """
+  Called by an HTTP.serve handler, answers its request with the WebSocket
+  handshake and returns the socket. The response the handler returns
+  afterwards is not sent. A request that is not a WebSocket handshake is
+  error("not a WebSocket request: ..."), and the handler answers it as it
+  likes.
+
+  [max_message_bytes: n] bounds incoming messages (16 MB by default); a
+  larger one closes the socket with code 1009. [compress: true] agrees to
+  compress messages with a client that offers to.
+
+    alx> ok(server) = HTTP.serve("127.0.0.1:0", fn request ->
+    ...>   case WebSocket.upgrade(request) do
+    ...>     ok(ws) ->
+    ...>       case WebSocket.recv(ws, 5000) do
+    ...>         ok(WebSocket.Event.text(text)) -> WebSocket.send(ws, String.upcase(text))
+    ...>         _ -> ok({})
+    ...>       end
+    ...>       WebSocket.recv(ws, 5000)
+    ...>       HTTP.text(200, "")
+    ...>     error(reason) -> HTTP.text(400, reason)
+    ...>   end
+    ...> end)
+    alx> ok(ws) = WebSocket.connect("ws://" <> HTTP.address(server) <> "/echo", 1000)
+    alx> WebSocket.send(ws, "hello")
+    ok({})
+    alx> WebSocket.recv(ws, 1000)
+    ok(WebSocket.Event.text("HELLO"))
+    alx> WebSocket.close(ws)
+    true
+    alx> HTTP.stop(server)
+    true
+  """
+  def upgrade(request: HTTP.Request): result[Socket, string] do
+    accept(request, 0, false)
+  end
+
+  def upgrade(request: HTTP.Request, options: list[tuple[atom, integer]]): result[Socket, string] do
+    limit = Enum.reduce(options, 0, fn option, limit ->
+      name = elem(option, 0)
+      value = elem(option, 1)
+      cond do
+        name == :max_message_bytes and value > 0 -> value
+        name == :max_message_bytes ->
+          raise("WebSocket.upgrade: max_message_bytes: must be positive")
+        name == :compress -> limit
+        true -> raise(unknown_upgrade(name))
+      end
+    end)
+    compress = Enum.any?(options, fn option -> elem(option, 0) == :compress and elem(option, 1) != 0 end)
+    accept(request, limit, compress)
+  end
+
+  def upgrade(request: HTTP.Request, options: list[tuple[atom, boolean]]): result[Socket, string] do
+    compress = Enum.reduce(options, false, fn option, _ ->
+      if elem(option, 0) != :compress do
+        raise(unknown_upgrade(elem(option, 0)))
+      end
+      elem(option, 1)
+    end)
+    accept(request, 0, compress)
+  end
+
+  defp unknown_upgrade(name: atom): string do
+    "WebSocket.upgrade: unknown option :" <> Atom.to_string(name) <> "; the options are max_message_bytes: and compress:"
+  end
+
+  defp accept(request: HTTP.Request, limit: integer, compress: boolean): result[Socket, string] do
+    names = Enum.map(request.headers, fn header -> elem(header, 0) end)
+    values = Enum.map(request.headers, fn header -> elem(header, 1) end)
+    case WebSocketNative.accept(request.method, names, values, compress) do
+      error(reason) -> error(reason)
+      ok(answer) ->
+        case HTTP.take_over(request) do
+          error("the connection has already been taken over") ->
+            error("the request has already been upgraded")
+          error("HTTP.take_over must be called by the process handling the request") ->
+            error("WebSocket.upgrade must be called by the process handling the request")
+          error(reason) -> error(reason)
+          ok(conn) ->
+            case TCP.send(conn, answer.response) do
+              ok(_) ->
+                ok(%Socket{conn: conn, protocol: WebSocketNative.new(false, limit, answer.deflate)})
+              error(reason) ->
+                TCP.close(conn)
+                error(reason)
+            end
+        end
+    end
+  end
+
+  @doc """
+  Opens a WebSocket to a ws:// or wss:// address, waiting up to the given
+  milliseconds for the connection and the handshake.
+
+  Options, as text: ca_file: a PEM file of certificates to trust, insecure:
+  "true" to trust any, origin: the Origin header to send, and compress:
+  "true" to offer to compress messages, which is done when the server
+  accepts. A list of {name, value} headers after the options is sent with
+  the handshake, as a browser sends Cookie or a client Authorization.
+  """
+  def connect(address: string, ms: integer): result[Socket, string] do
+    connect(address, ms, [], [])
+  end
+
+  def connect(address: string, ms: integer, options: list[tuple[atom, string]]): result[Socket, string] do
+    connect(address, ms, options, [])
+  end
+
+  def connect(address: string, ms: integer, options: list[tuple[atom, string]], headers: list[tuple[string, string]]): result[Socket, string] do
+    Enum.each(options, fn option ->
+      if not Enum.member?([:ca_file, :insecure, :origin, :compress], elem(option, 0)) do
+        raise("WebSocket.connect: unknown option :" <> Atom.to_string(elem(option, 0)) <> "; the options are ca_file:, insecure:, origin: and compress:")
+      end
+    end)
+    compress = setting(options, :compress) == "true"
+    names = Enum.map(headers, fn header -> elem(header, 0) end)
+    values = Enum.map(headers, fn header -> elem(header, 1) end)
+    started = Time.monotonic()
+    case WebSocketNative.ask(address, setting(options, :origin), compress, names, values) do
+      error(reason) -> error(reason)
+      ok(offer) ->
+        opened = if offer.secure do
+          trust = Enum.filter(options, fn option ->
+            elem(option, 0) == :ca_file or elem(option, 0) == :insecure
+          end)
+          TCP.connect_tls(offer.address, ms, [{:server_name, offer.name} | trust])
+        else
+          TCP.connect(offer.address, ms)
+        end
+        case opened do
+          error(reason) -> error(reason)
+          ok(conn) ->
+            case handshake(conn, offer, compress, ms, started) do
+              ok(deflate) ->
+                ok(%Socket{conn: conn, protocol: WebSocketNative.new(true, 0, deflate)})
+              error(reason) ->
+                TCP.close(conn)
+                error(reason)
+            end
+        end
+    end
+  end
+
+  # The last setting of an option, or "".
+  defp setting(options: list[tuple[atom, string]], name: atom): string do
+    Enum.reduce(options, "", fn option, found ->
+      if elem(option, 0) == name do
+        elem(option, 1)
+      else
+        found
+      end
+    end)
+  end
+
+  # What is left of a wait of ms milliseconds that began at started; a
+  # negative wait has no end.
+  defp left(ms: integer, started: integer): integer do
+    if ms < 0 do
+      ms
+    else
+      max(0, ms - (Time.monotonic() - started) / 1000)
+    end
+  end
+
+  defp handshake(conn: socket, offer: WebSocketNative.Offer, compress: boolean, ms: integer, started: integer): result[boolean, string] do
+    case TCP.send(conn, offer.request) do
+      error(reason) -> error(reason)
+      ok(_) ->
+        case TCP.recv_line(conn, left(ms, started)) do
+          error(reason) -> error(reason)
+          ok(status) ->
+            case head(conn, ms, started, []) do
+              error(reason) -> error(reason)
+              ok(lines) -> WebSocketNative.agreed(status, lines, offer.key, compress)
+            end
+        end
+    end
+  end
+
+  # The header lines of a response, up to the empty line that ends them.
+  defp head(conn: socket, ms: integer, started: integer, lines: list[string]): result[list[string], string] do
+    case TCP.recv_line(conn, left(ms, started)) do
+      error(reason) -> error(reason)
+      ok("") -> ok(lines)
+      ok(line) ->
+        if length(lines) >= 200 do
+          error("the server sent too many headers")
+        else
+          head(conn, ms, started, [line | lines])
+        end
+    end
+  end
+
+  @doc """
+  Sends a text message.
+  """
+  def send(ws: Socket, text: string): result[tuple[], string] do
+    transmit(ws, 1, text)
+  end
+
+  @doc """
+  Sends a binary message: any bytes, which arrive as
+  WebSocket.Event.binary.
+  """
+  def send_binary(ws: Socket, data: string): result[tuple[], string] do
+    transmit(ws, 2, data)
+  end
+
+  defp transmit(ws: Socket, op: integer, data: string): result[tuple[], string] do
+    case WebSocketNative.message(ws.protocol, op, data) do
+      error(reason) -> error(reason)
+      ok(frame) ->
+        case TCP.send(ws.conn, frame) do
+          ok(_) -> ok({})
+          error(reason) ->
+            TCP.close(ws.conn)
+            error(reason)
+        end
+    end
+  end
+
+  @doc """
+  Waits up to the given milliseconds for the next event: a text or binary
+  message, WebSocket.Event.closed(code, reason) when the other end closes,
+  or WebSocket.Event.error(reason) when the connection fails. After the last
+  event it is error("closed"). A connection that ends without the closing
+  handshake gives closed(1006, "").
+  """
+  def recv(ws: Socket, ms: integer): result[Event, string] do
+    if WebSocketNative.active(ws.protocol) do
+      error("the socket is active")
+    else
+      next(ws, ms, Time.monotonic())
+    end
+  end
+
+  defp next(ws: Socket, ms: integer, started: integer): result[Event, string] do
+    answer(ws)
+    case WebSocketNative.take(ws.protocol) do
+      some(event) -> ok(given(ws, event))
+      none ->
+        remaining = left(ms, started)
+        cond do
+          WebSocketNative.ended(ws.protocol) -> error("closed")
+          remaining == 0 -> error("timeout")
+          true ->
+            read(ws, remaining)
+            next(ws, ms, started)
+        end
+    end
+  end
+
+  # Reads the connection once, for no longer than a slice, and gives what
+  # arrived to the protocol.
+  defp read(ws: Socket, remaining: integer): boolean do
+    wait = if remaining < 0 or remaining > @slice do
+      @slice
+    else
+      remaining
+    end
+    case TCP.recv(ws.conn, 0, wait) do
+      ok(data) -> WebSocketNative.feed(ws.protocol, data)
+      error("timeout") -> false
+      error(reason) -> WebSocketNative.lost(ws.protocol, reason)
+    end
+  end
+
+  # Writes what the protocol answers by itself: pongs, and its side of a
+  # closing handshake the other end began.
+  defp answer(ws: Socket): boolean do
+    case WebSocketNative.reply(ws.protocol) do
+      none -> true
+      some(frame) ->
+        TCP.send(ws.conn, frame)
+        answer(ws)
+    end
+  end
+
+  # The event a reader is given. The last one drops the connection.
+  defp given(ws: Socket, event: WebSocketNative.Event): Event do
+    case event.kind do
+      "text" -> Event.text(event.text)
+      "binary" -> Event.binary(event.text)
+      "closed" ->
+        TCP.close(ws.conn)
+        Event.closed(event.code, event.text)
+      _ ->
+        TCP.close(ws.conn)
+        Event.error(event.text)
+    end
+  end
+
+  @doc """
+  Closes with code 1000, or with a code from 3000 to 4999 and a reason of at
+  most 123 bytes, waiting up to a second for the other end to answer. false
+  when the socket was already closed or another process is closing it: of
+  several processes closing a socket at once, one gets true.
+  """
+  def close(ws: Socket): boolean do
+    finish(ws, 1000, "")
+  end
+
+  def close(ws: Socket, code: integer, reason: string): boolean do
+    if code != 1000 and (code < 3000 or code > 4999) do
+      raise("WebSocket.close: the code must be 1000 or 3000 to 4999, not " <> Integer.to_string(code))
+    end
+    if byte_size(reason) > 123 or not String.valid?(reason) do
+      raise("WebSocket.close: the reason must be valid text of at most 123 bytes")
+    end
+    finish(ws, code, reason)
+  end
+
+  defp finish(ws: Socket, code: integer, reason: string): boolean do
+    case WebSocketNative.shut(ws.protocol, code, reason) do
+      none -> false
+      some(closing) ->
+        if closing.send do
+          TCP.send(ws.conn, closing.frame)
+        end
+        await(ws, Time.monotonic())
+        WebSocketNative.closed(ws.protocol)
+        TCP.close(ws.conn)
+        true
+    end
+  end
+
+  # Waits up to a second for the other end's close, reading the connection
+  # unless another process's read brings it.
+  defp await(ws: Socket, started: integer): boolean do
+    answer(ws)
+    remaining = left(1000, started)
+    if WebSocketNative.ended(ws.protocol) or remaining == 0 do
+      true
+    else
+      read(ws, remaining)
+      await(ws, started)
+    end
+  end
+
+  @doc """
+  Hands a socket to another process, whose end then drops its connection
+  instead of the maker's. A process whose messages are not WebSocket.Event
+  is given the socket with TCP.controlling_process(ws.conn, pid).
+  """
+  def controlling_process(ws: Socket, to: pid[Event]): boolean do
+    TCP.controlling_process(ws.conn, to)
+  end
+
+  @doc """
+  active: true sends every event to the calling process as a
+  WebSocket.Event message, active: :once sends one, and active: false stops.
+  The calling process's messages must be WebSocket.Event. While a socket is
+  active, WebSocket.recv is error("the socket is active").
+  """
+  def setopts(ws: Socket, options: list[tuple[atom, atom]]): result[tuple[], string] do
+    to: pid[Event] = Process.self(64)
+    Enum.each(options, fn option ->
+      count = case option do
+        {:active, :true} -> -1
+        {:active, :once} -> 1
+        {:active, :false} -> 0
+        _ -> raise("WebSocket.setopts: the option is active: true, :once or false")
+      end
+      if WebSocketNative.activate(ws.protocol, count) do
+        Process.spawn(fn(self: pid[integer]): integer do
+          pump(ws, to)
+        end, 1)
+      end
+    end)
+    ok({})
+  end
+
+  # Sends events to a process while the socket is active.
+  defp pump(ws: Socket, to: pid[Event]): integer do
+    answer(ws)
+    cond do
+      not WebSocketNative.pumping(ws.protocol) -> 0
+      true ->
+        case WebSocketNative.take(ws.protocol) do
+          some(event) ->
+            last = WebSocketNative.sending(ws.protocol, event.kind == "closed" or event.kind == "error")
+            if deliver(to, given(ws, event)) and not last do
+              pump(ws, to)
+            else
+              0
+            end
+          none ->
+            if WebSocketNative.ended(ws.protocol) do
+              WebSocketNative.sending(ws.protocol, true)
+              0
+            else
+              read(ws, -1)
+              pump(ws, to)
+            end
+        end
+    end
+  end
+
+  # Queues an event for a process, waiting for room as long as the process
+  # lives.
+  defp deliver(to: pid[Event], event: Event): boolean do
+    cond do
+      Process.send(to, event, 50) -> true
+      Process.alive(to) -> deliver(to, event)
+      true -> false
+    end
+  end
+
+  @doc """
+  The address of the other end, host:port.
+  """
+  def peer(ws: Socket): string do
+    case TCP.peer(ws.conn) do
+      some(address) -> address
+      none -> ""
+    end
+  end
+
+  @doc """
+  Reports whether the handshake agreed to compress messages: the server
+  upgraded with compress: and the client offered it.
+  """
+  def compressed?(ws: Socket): boolean do
+    WebSocketNative.compressed(ws.protocol)
+  end
+end
