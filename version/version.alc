@@ -1,0 +1,406 @@
+defmodule Version do
+  @moduledoc """
+  Semantic versions: parsing, comparing, and matching against requirements
+  such as ">= 1.2.0" and "~> 1.4".
+  """
+  require "alchem" "v0.3.10"
+
+  @typedoc """
+  A semantic version, with its pre-release identifiers and build metadata.
+  """
+  struct Version do
+    major: integer
+    minor: integer
+    patch: integer
+    pre: list[string] = []
+    build: option[string] = none
+  end
+
+  @typedoc """
+  A requirement that has been checked, so that matching it cannot fail.
+  """
+  struct Requirement do
+    source: string
+  end
+
+  # The parts of a version that order it: its numbers and its pre-release,
+  # as written. The build is ignored.
+  struct Parts do
+    major: integer
+    minor: integer
+    patch: integer
+    pre: string
+  end
+
+  @doc ~S"""
+  Parses a semantic version into a Version struct, with its pre-release
+  identifiers and build metadata.
+
+      alx> ok(v) = Version.parse("2.10.3")
+      alx> {v.major, v.minor, v.patch}
+      {2, 10, 3}
+      alx> ok(pre) = Version.parse("1.0.0-rc.1+build5")
+      alx> {pre.pre, pre.build}
+      {["rc", "1"], some("build5")}
+      alx> case Version.parse("1.2") do
+      ...>   ok(_) -> "valid"
+      ...>   error(reason) -> reason
+      ...> end
+      "invalid version \"1.2\""
+  """
+  def parse(text: string): result[Version, string] do
+    case parts(text) do
+      none -> error(invalid("version", text))
+      some(found) ->
+        pre = if found.pre == "" do
+          []
+        else
+          String.split(found.pre, ".")
+        end
+        {_, build, built} = cut(text, "+")
+        ok(%Version{major: found.major, minor: found.minor, patch: found.patch, pre: pre, build: if built do
+          some(build)
+        else
+          none
+        end})
+    end
+  end
+
+  @doc """
+  Parses a semantic version into a Version struct, failing when it is not
+  one.
+
+      alx> Version.parse!("1.2.3").minor
+      2
+  """
+  def parse!(text: string): Version do
+    case parse(text) do
+      ok(version) -> version
+      error(reason) -> raise(reason)
+    end
+  end
+
+  @doc """
+  Writes a Version back as text.
+
+      alx> Version.to_string(%Version{major: 2, minor: 0, patch: 1, pre: ["beta", "2"]})
+      "2.0.1-beta.2"
+  """
+  def to_string(version: Version): string do
+    numbers = Integer.to_string(version.major) <> "." <> Integer.to_string(version.minor) <> "." <> Integer.to_string(version.patch)
+    released = if version.pre == [] do
+      numbers
+    else
+      numbers <> "-" <> Enum.join(version.pre, ".")
+    end
+    case version.build do
+      some(build) -> released <> "+" <> build
+      none -> released
+    end
+  end
+
+  @doc """
+  Checks a requirement once, giving a Version.Requirement to match versions
+  against.
+
+      alx> ok(req) = Version.parse_requirement("~> 2.0")
+      alx> Version.match?("2.4.0", req)
+      true
+      alx> case Version.parse_requirement("bogus") do
+      ...>   ok(_) -> "valid"
+      ...>   error(_) -> "invalid"
+      ...> end
+      "invalid"
+  """
+  def parse_requirement(text: string): result[Requirement, string] do
+    case met(%Parts{major: 0, minor: 0, patch: 0, pre: ""}, text) do
+      none -> error(invalid("requirement", text))
+      some(_) -> ok(%Requirement{source: text})
+    end
+  end
+
+  @doc """
+  Like Version.parse_requirement, failing on an invalid requirement.
+
+      alx> Version.match?("1.0.0", Version.parse_requirement!(">= 1.0.0"))
+      true
+  """
+  def parse_requirement!(text: string): Requirement do
+    case parse_requirement(text) do
+      ok(requirement) -> requirement
+      error(reason) -> raise(reason)
+    end
+  end
+
+  @doc """
+  Returns :lt, :eq or :gt as the first version is lower than, equal to or
+  higher than the second. A pre-release is lower than its release. Fails on
+  an invalid version.
+
+      alx> Version.compare("1.9.0", "1.10.0")
+      :lt
+      alx> Version.compare("2.0.0-rc.1", "2.0.0")
+      :lt
+      alx> Version.compare("1.0.0-alpha.2", "1.0.0-alpha.10")
+      :lt
+      alx> Version.compare("3.1.4", "3.1.4")
+      :eq
+  """
+  def compare(a: string, b: string): atom do
+    order = order(known(a), known(b))
+    cond do
+      order < 0 -> :lt
+      order > 0 -> :gt
+      true -> :eq
+    end
+  end
+
+  def compare(a: Version, b: Version): atom do
+    compare(to_string(a), to_string(b))
+  end
+
+  @doc """
+  Reports whether a version meets a requirement: comparisons with ==, !=,
+  >, >=, <, <= and ~>, joined by and and or. ~> 2.1 allows 2.1 and later
+  within 2; ~> 2.1.3 allows 2.1.3 and later within 2.1. Fails on an invalid
+  version or requirement.
+
+  [allow_pre: false] makes a pre-release match only a requirement that
+  names a pre-release.
+
+      alx> Version.match?("2.3.1", "~> 2.1")
+      true
+      alx> Version.match?("3.0.0", "~> 2.1")
+      false
+      alx> Version.match?("2.1.9", "~> 2.1.3")
+      true
+      alx> Version.match?("1.5.0", ">= 1.0.0 and < 2.0.0")
+      true
+      alx> Version.match?("0.9.0", ">= 1.0.0 or == 0.9.0")
+      true
+      alx> Version.match?("2.1.0-rc.1", "~> 2.0", [allow_pre: false])
+      false
+      alx> Version.match?(Version.parse!("2.3.0"), "~> 2.1")
+      true
+  """
+  def match?(version: string, requirement: string): boolean do
+    case parts(version) do
+      some(found) ->
+        case met(found, requirement) do
+          some(answer) -> answer
+          none -> raise(invalid("requirement", requirement))
+        end
+      none ->
+        # A requirement that is wrong too is what is reported.
+        parse_requirement!(requirement)
+        raise(invalid("version", version))
+    end
+  end
+
+  def match?(version: Version, requirement: string): boolean do
+    match?(to_string(version), requirement)
+  end
+
+  def match?(version: Version, requirement: Requirement): boolean do
+    match?(to_string(version), requirement.source)
+  end
+
+  def match?(version: string, requirement: Requirement): boolean do
+    match?(version, requirement.source)
+  end
+
+  def match?(version: string, requirement: string, options: list[tuple[atom, boolean]]): boolean do
+    strict = Enum.reduce(options, false, fn option, strict ->
+      if elem(option, 0) != :allow_pre do
+        raise("Version.match? takes allow_pre:")
+      end
+      strict or not elem(option, 1)
+    end)
+    held = case parts(version) do
+      some(found) -> strict and found.pre != "" and not String.contains?(requirement, "-")
+      none -> false
+    end
+    if held do
+      parse_requirement!(requirement)
+      false
+    else
+      match?(version, requirement)
+    end
+  end
+
+  defp invalid(what: string, text: string): string do
+    "invalid " <> what <> " " <> inspect(text)
+  end
+
+  # Splits text at the first separator: what is before it, what is after,
+  # and whether it was there.
+  defp cut(text: string, separator: string): tuple[string, string, boolean] do
+    case String.split(text, separator) do
+      [first, second | rest] -> {first, Enum.join([second | rest], separator), true}
+      _ -> {text, "", false}
+    end
+  end
+
+  # A number of a version: digits, without a sign or a leading zero.
+  defp number(field: string): option[integer] do
+    case Integer.parse(field) do
+      ok(n) ->
+        if n >= 0 and Integer.to_string(n) == field do
+          some(n)
+        else
+          none
+        end
+      error(_) -> none
+    end
+  end
+
+  # Reads MAJOR.MINOR.PATCH with an optional -pre-release and +build.
+  defp parts(text: string): option[Parts] do
+    {versioned, _, _} = cut(text, "+")
+    {core, pre, dashed} = cut(versioned, "-")
+    numbers = Enum.map(String.split(core, "."), fn field -> number(field) end)
+    case numbers do
+      [some(major), some(minor), some(patch)] ->
+        if dashed and pre == "" do
+          none
+        else
+          some(%Parts{major: major, minor: minor, patch: patch, pre: pre})
+        end
+      _ -> none
+    end
+  end
+
+  defp known(text: string): Parts do
+    case parts(text) do
+      some(found) -> found
+      none -> raise(invalid("version", text))
+    end
+  end
+
+  defp sign(a: integer, b: integer): integer do
+    cond do
+      a < b -> -1
+      a > b -> 1
+      true -> 0
+    end
+  end
+
+  # Orders two versions: negative, zero or positive. A pre-release sorts
+  # before its release, and pre-release identifiers compare as numbers when
+  # both are numbers.
+  defp order(a: Parts, b: Parts): integer do
+    cond do
+      a.major != b.major -> sign(a.major, b.major)
+      a.minor != b.minor -> sign(a.minor, b.minor)
+      a.patch != b.patch -> sign(a.patch, b.patch)
+      a.pre == b.pre -> 0
+      a.pre == "" -> 1
+      b.pre == "" -> -1
+      true -> identifiers(String.split(a.pre, "."), String.split(b.pre, "."))
+    end
+  end
+
+  defp identifiers(a: list[string], b: list[string]): integer do
+    case {a, b} do
+      {[], []} -> 1
+      {[], _} -> -1
+      {_, []} -> 1
+      {[x | more], [y | others]} ->
+        order = case {Integer.parse(x), Integer.parse(y)} do
+          {ok(m), ok(n)} -> sign(m, n)
+          {ok(_), _} -> -1
+          {_, ok(_)} -> 1
+          _ ->
+            cond do
+              x < y -> -1
+              x > y -> 1
+              true -> 0
+            end
+        end
+        if order != 0 do
+          order
+        else
+          identifiers(more, others)
+        end
+    end
+  end
+
+  # Whether a version meets a requirement, or none when the requirement is
+  # not one: comparisons joined by "and" and "or", where "or" binds more
+  # loosely.
+  defp met(version: Parts, requirement: string): option[boolean] do
+    case String.split(requirement) do
+      [] -> none
+      words -> clauses(version, words, false, true)
+    end
+  end
+
+  defp clauses(version: Parts, words: list[string], any: boolean, all: boolean): option[boolean] do
+    case words do
+      [operator, target] ->
+        case clause(version, operator, target) do
+          some(held) -> some(any or (all and held))
+          none -> none
+        end
+      [operator, target, "and", next | rest] ->
+        case clause(version, operator, target) do
+          some(held) -> clauses(version, [next | rest], any, all and held)
+          none -> none
+        end
+      [operator, target, "or", next | rest] ->
+        case clause(version, operator, target) do
+          some(held) -> clauses(version, [next | rest], any or (all and held), true)
+          none -> none
+        end
+      _ -> none
+    end
+  end
+
+  # One comparison of a requirement.
+  defp clause(version: Parts, operator: string, target: string): option[boolean] do
+    if operator == "~>" do
+      approximately(version, target)
+    else
+      case parts(target) do
+        none -> none
+        some(wanted) ->
+          order = order(version, wanted)
+          case operator do
+            "==" -> some(order == 0)
+            "!=" -> some(order != 0)
+            ">" -> some(order > 0)
+            ">=" -> some(order >= 0)
+            "<" -> some(order < 0)
+            "<=" -> some(order <= 0)
+            _ -> none
+          end
+      end
+    end
+  end
+
+  # ~> 2.1 allows 2.x from 2.1 up; ~> 2.1.3 allows 2.1.x from 2.1.3 up.
+  defp approximately(version: Parts, target: string): option[boolean] do
+    {numbers, _, _} = cut(target, "-")
+    bounds = case String.split(numbers, ".") do
+      [major, _] ->
+        case Integer.parse(major) do
+          ok(n) -> some({target <> ".0", Integer.to_string(n + 1) <> ".0.0"})
+          error(_) -> none
+        end
+      [major, minor, _] ->
+        case Integer.parse(minor) do
+          ok(n) -> some({target, major <> "." <> Integer.to_string(n + 1) <> ".0"})
+          error(_) -> none
+        end
+      _ -> none
+    end
+    case bounds do
+      none -> none
+      some({lower, upper}) ->
+        case {parts(lower), parts(upper)} do
+          {some(from), some(to)} -> some(order(version, from) >= 0 and order(version, to) < 0)
+          _ -> none
+        end
+    end
+  end
+end

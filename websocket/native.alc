@@ -1,0 +1,69 @@
+defmodule WebSocketNative do
+  @moduledoc """
+  The Go functions behind WebSocket: the protocol without its connection.
+  Use WebSocket; this module is how it reaches them.
+  """
+  require "alchem" "v0.3.10"
+
+  extern shared type Protocol = "*./native.Protocol"
+
+  struct Event do
+    kind: string
+    text: string
+    code: integer
+  end
+
+  struct Answer do
+    response: string
+    deflate: boolean
+  end
+
+  struct Offer do
+    address: string
+    secure: boolean
+    name: string
+    request: string
+    key: string
+  end
+
+  struct Closing do
+    frame: string
+    send: boolean
+  end
+
+  extern new(client: boolean, limit: integer, deflate: boolean): Protocol = "./native.New"
+
+  extern compressed(protocol: Protocol): boolean = "./native.Protocol.Compressed"
+
+  extern feed(protocol: Protocol, data: string): boolean = "./native.Protocol.Feed"
+
+  extern lost(protocol: Protocol, problem: string): boolean = "./native.Protocol.Lost"
+
+  extern reply(protocol: Protocol): option[string] = "./native.Protocol.Reply"
+
+  extern take(protocol: Protocol): option[Event] = "./native.Protocol.Take"
+
+  extern ended(protocol: Protocol): boolean = "./native.Protocol.Ended"
+
+  extern drained(protocol: Protocol): boolean = "./native.Protocol.Drained"
+
+  extern message(protocol: Protocol, op: integer, data: string): result[string, string] = "./native.Protocol.Message"
+
+  extern shut(protocol: Protocol, code: integer, reason: string): option[Closing] = "./native.Protocol.Shut"
+
+  extern closed(protocol: Protocol): boolean = "./native.Protocol.Closed"
+
+  extern activate(protocol: Protocol, count: integer): boolean = "./native.Protocol.Activate"
+
+  extern active(protocol: Protocol): boolean = "./native.Protocol.Active"
+
+  extern pumping(protocol: Protocol): boolean = "./native.Protocol.Pumping"
+
+  extern sending(protocol: Protocol, final: boolean): boolean = "./native.Protocol.Sending"
+
+  extern accept(method: string, names: list[string], values: list[string], compress: boolean): result[Answer, string] = "./native.Accept"
+
+  extern ask(address: string, origin: string, compress: boolean, names: list[string], values: list[string]): result[Offer, string] = "./native.Ask"
+
+  extern agreed(status: string, lines: list[string], key: string, compress: boolean): result[boolean, string] = "./native.Agreed"
+end
