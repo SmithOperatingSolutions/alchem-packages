@@ -2,11 +2,13 @@ defmodule DiskStore do
   @moduledoc """
   Records that outlast the program: text kept under text keys in one file.
 
-  Every change is written through to the disk before the call that made it
-  returns, so a change that was acknowledged survives a crash. Keys and
-  values are also held in memory, keys in order, so reads never touch the
-  disk and a store holds only what fits in memory. A store may be used by
-  any number of processes at once, and one program at a time opens a file.
+  Every change is written through to the disk before the call that made
+  it returns, so a change that was acknowledged survives a crash of the
+  program or of the machine, and a change that a crash cut short is
+  dropped whole when the file is next opened. Keys and values are also held in memory, keys in order, so reads never
+  touch the disk and a store holds only what fits in memory. A store may
+  be used by any number of processes at once, and one program at a time
+  opens a file.
 
       alx> path = Path.join(System.tmp_dir!(), "disk_store_doc_" <> Base.encode16(Crypto.strong_rand_bytes(6)))
       alx> ok(store) = DiskStore.open(path)
@@ -19,15 +21,56 @@ defmodule DiskStore do
       alx> File.rm(path)
       ok({})
   """
-  import "native.alc"
-  require "alchem" "v0.3.8"
+  require "alchem" "v0.4.2"
+
+  # The file is a log: magic, then records. A record is the length of its
+  # body and the body's CRC-32, four bytes each with the lowest first, then
+  # the body: one or more changes, each a byte saying put (1) or delete (2),
+  # the key, and for a put the value, each behind its length as a varint.
+  # The changes of one record take effect together.
+  @magic "ALCHEMSTORE1\n"
+  # How far the file may outgrow what it holds before it is written afresh.
+  @slack 1048576
+  # How long a call waits for the process that holds a store.
+  @wait 60000
 
   @typedoc """
   An open store. It can be sent to other processes and kept by servers; it
   cannot be compared.
   """
   struct Store do
-    log: DiskStoreNative.Log
+    id: integer
+    path: string
+    held: agent[Held]
+  end
+
+  # What the process behind a store holds: the file, its length, the
+  # length it would have holding only what is current, and the entries.
+  struct Held do
+    open: boolean
+    path: string
+    values: map[string, string]
+    size: integer
+    live: integer
+  end
+
+  # The stores that are open, by path: opening a file a second time gives
+  # the same store, since two logs appending to one file would spoil it.
+  struct Opened do
+    id: integer
+    held: agent[Held]
+  end
+
+  struct Opens do
+    next: integer
+    open: map[string, Opened]
+  end
+
+  # A put of a value under a key or, with put false, a delete of the key.
+  struct Change do
+    put: boolean
+    key: string
+    value: string
   end
 
   @doc """
@@ -37,10 +80,20 @@ defmodule DiskStore do
   error("... is not a store"), and is left as it is.
   """
   def open(path: string): result[Store, string] do
-    case DiskStoreNative.open(path) do
-      ok(log) -> ok(%Store{log: log})
-      error(reason) -> error(reason)
-    end
+    full = Path.expand(path)
+    Agent.get_and_update(registry(), fn reg ->
+      case Map.fetch(reg.open, full) do
+        some(known) -> {ok(%Store{id: known.id, path: full, held: known.held}), reg}
+        none ->
+          case load(path, full) do
+            error(reason) -> {error(reason), reg}
+            ok(held) ->
+              agent = Agent.start(fn -> held end)
+              opened = %Opened{id: reg.next, held: agent}
+              {ok(%Store{id: reg.next, path: full, held: agent}), %Opens{next: reg.next + 1, open: Map.put(reg.open, full, opened)}}
+          end
+      end
+    end, @wait)
   end
 
   @doc """
@@ -49,7 +102,19 @@ defmodule DiskStore do
   it fails.
   """
   def close(store: Store): boolean do
-    DiskStoreNative.close(store.log)
+    Agent.get_and_update(registry(), fn reg ->
+      was = Agent.get_and_update(store.held, fn held -> {held.open, %Held{held | open: false, values: %{}}} end, @wait)
+      left = case Map.fetch(reg.open, store.path) do
+        some(known) ->
+          if known.id == store.id do
+            Map.delete(reg.open, store.path)
+          else
+            reg.open
+          end
+        none -> reg.open
+      end
+      {was, %Opens{reg | open: left}}
+    end, @wait)
   end
 
   @doc """
@@ -57,14 +122,14 @@ defmodule DiskStore do
   change is on the disk.
   """
   def put(store: Store, key: string, value: string): result[tuple[], string] do
-    DiskStoreNative.put(store.log, key, value)
+    write(store, [%Change{put: true, key: key, value: value}], false)
   end
 
   @doc """
   Removes a key. Removing a key that is not there is ok.
   """
   def delete(store: Store, key: string): result[tuple[], string] do
-    DiskStoreNative.remove(store.log, key)
+    write(store, [%Change{put: false, key: key, value: ""}], false)
   end
 
   @doc """
@@ -85,16 +150,23 @@ defmodule DiskStore do
       ok({})
   """
   def commit(store: Store, puts: list[tuple[string, string]], deletes: list[string]): result[tuple[], string] do
-    keys = Enum.map(puts, fn {key, _} -> key end)
-    values = Enum.map(puts, fn {_, value} -> value end)
-    DiskStoreNative.commit(store.log, keys, values, deletes)
+    removed = Enum.map(deletes, fn key -> %Change{put: false, key: key, value: ""} end)
+    added = Enum.map(puts, fn {key, value} -> %Change{put: true, key: key, value: value} end)
+    changes = removed ++ added
+    if changes == [] do
+      ok({})
+    else
+      write(store, changes, false)
+    end
   end
 
   @doc """
   Changes one key by a function of what it holds, with no other write to
-  the store in between. The function is given some(value) or none, and
-  what it gives is stored, none removing the key. The result is what the
-  function gave.
+  that key in between. The function is given some(value) or none, and what
+  it gives is stored, none removing the key. The result is what the
+  function gave. The function runs in the calling process; when the key
+  changes while it runs, it is run again on what the key holds then. A
+  function that fails changes nothing.
 
       alx> path = Path.join(System.tmp_dir!(), "disk_store_doc_" <> Base.encode16(Crypto.strong_rand_bytes(6)))
       alx> ok(store) = DiskStore.open(path)
@@ -114,25 +186,41 @@ defmodule DiskStore do
       ok({})
   """
   def update(store: Store, key: string, change: fn[option[string], option[string]]): result[option[string], string] do
-    outcome = DiskStoreNative.update(store.log, key, fn(held: DiskStoreNative.Choice): DiskStoreNative.Choice do
-      given = if held.keep do
-        some(held.value)
+    seen = Agent.get(store.held, fn held ->
+      if held.open do
+        some(Map.fetch(held.values, key))
       else
         none
       end
-      case change(given) do
-        some(value) -> %DiskStoreNative.Choice{value: value, keep: true}
-        none -> %DiskStoreNative.Choice{value: "", keep: false}
-      end
-    end)
-    case outcome do
-      ok(left) ->
-        if left.keep do
-          ok(some(left.value))
-        else
+    end, @wait)
+    case seen do
+      none -> error("closed")
+      some(before) ->
+        after = change(before)
+        if after == none and before == none do
           ok(none)
+        else
+          made = case after do
+            some(value) -> %Change{put: true, key: key, value: value}
+            none -> %Change{put: false, key: key, value: ""}
+          end
+          outcome: option[result[option[string], string]] = Agent.get_and_update(store.held, fn held ->
+            cond do
+              not held.open -> {some(error("closed")), held}
+              Map.fetch(held.values, key) != before -> {none, held}
+              true ->
+                {written, next} = changed(held, [made], false)
+                case written do
+                  ok(_) -> {some(ok(after)), next}
+                  error(_) -> {some(error("the change could not be written")), next}
+                end
+            end
+          end, @wait)
+          case outcome do
+            some(answer) -> answer
+            none -> update(store, key, change)
+          end
         end
-      error(reason) -> error(reason)
     end
   end
 
@@ -141,42 +229,94 @@ defmodule DiskStore do
   this by itself when its file has grown well past what it holds.
   """
   def compact(store: Store): result[tuple[], string] do
-    DiskStoreNative.compact(store.log)
+    write(store, [], true)
   end
 
+  # Reading a closed store is a mistake in the program, which fails the
+  # calling process.
   @doc """
   The value under a key, or none.
   """
   def get(store: Store, key: string): option[string] do
-    DiskStoreNative.get(store.log, key)
+    found = Agent.get(store.held, fn held ->
+      if held.open do
+        some(Map.fetch(held.values, key))
+      else
+        none
+      end
+    end, @wait)
+    case found do
+      some(value) -> value
+      none -> raise("DiskStore.get: the store is closed")
+    end
   end
 
   @doc """
   Whether a key is present.
   """
   def has_key?(store: Store, key: string): boolean do
-    DiskStoreNative.has_key(store.log, key)
+    found = Agent.get(store.held, fn held ->
+      if held.open do
+        some(Map.has_key?(held.values, key))
+      else
+        none
+      end
+    end, @wait)
+    case found do
+      some(present) -> present
+      none -> raise("DiskStore.has_key?: the store is closed")
+    end
   end
 
   @doc """
   Every key, in order.
   """
   def keys(store: Store): list[string] do
-    DiskStoreNative.keys(store.log)
+    found = Agent.get(store.held, fn held ->
+      if held.open do
+        some(Map.keys(held.values))
+      else
+        none
+      end
+    end, @wait)
+    case found do
+      some(keys) -> keys
+      none -> raise("DiskStore.keys: the store is closed")
+    end
   end
 
   @doc """
   How many keys the store holds.
   """
   def size(store: Store): integer do
-    DiskStoreNative.size(store.log)
+    found = Agent.get(store.held, fn held ->
+      if held.open do
+        some(map_size(held.values))
+      else
+        none
+      end
+    end, @wait)
+    case found do
+      some(count) -> count
+      none -> raise("DiskStore.size: the store is closed")
+    end
   end
 
   @doc """
   The entries from one key up to, and not including, another, in key order.
   """
   def range(store: Store, from: string, to: string): list[tuple[string, string]] do
-    Enum.map(DiskStoreNative.range(store.log, from, to), fn entry -> {entry.key, entry.value} end)
+    found = Agent.get(store.held, fn held ->
+      if held.open do
+        some(Enum.filter(Map.to_list(held.values), fn {key, _} -> key >= from and key < to end))
+      else
+        none
+      end
+    end, @wait)
+    case found do
+      some(entries) -> entries
+      none -> raise("DiskStore.range: the store is closed")
+    end
   end
 
   @doc """
@@ -195,6 +335,295 @@ defmodule DiskStore do
       ok({})
   """
   def prefix(store: Store, prefix: string): list[tuple[string, string]] do
-    Enum.map(DiskStoreNative.prefix(store.log, prefix), fn entry -> {entry.key, entry.value} end)
+    found = Agent.get(store.held, fn held ->
+      if held.open do
+        some(Enum.filter(Map.to_list(held.values), fn {key, _} -> String.starts_with?(key, prefix) end))
+      else
+        none
+      end
+    end, @wait)
+    case found do
+      some(entries) -> entries
+      none -> raise("DiskStore.prefix: the store is closed")
+    end
+  end
+
+  # The process that knows which stores are open, started by the first
+  # open. Two first opens at once both try to start it, and the one that
+  # loses finds the other's.
+  defp registry(): agent[Opens] do
+    found: option[agent[Opens]] = Agent.whereis(:alchem_disk_store_registry)
+    case found do
+      some(agent) -> agent
+      none ->
+        try do
+          Agent.start(fn(): Opens do
+            %Opens{next: 1, open: %{}}
+          end, [name: :alchem_disk_store_registry])
+        rescue
+          _ -> registry()
+        end
+    end
+  end
+
+  # Hands changes, or a request to rewrite the file, to the process that
+  # holds the store, which makes them one at a time.
+  defp write(store: Store, changes: list[Change], compact: boolean): result[tuple[], string] do
+    Agent.get_and_update(store.held, fn held ->
+      if held.open do
+        changed(held, changes, compact)
+      else
+        {error("closed"), held}
+      end
+    end, @wait)
+  end
+
+  # Appends a record of the changes and makes them, then rewrites the file
+  # when that was asked for or the file has grown well past what it holds.
+  defp changed(held: Held, changes: list[Change], compact: boolean): tuple[result[tuple[], string], Held] do
+    appended = if changes == [] do
+      ok(held)
+    else
+      append(held, changes)
+    end
+    case appended do
+      error(reason) -> {error(reason), held}
+      ok(next) ->
+        if compact or next.size > 2 * next.live + @slack do
+          case rewrite(next) do
+            ok(fresh) -> {ok({}), fresh}
+            # Tidying up is not what a plain write asked for.
+            error(reason) ->
+              if compact do
+                {error(reason), next}
+              else
+                {ok({}), next}
+              end
+          end
+        else
+          {ok({}), next}
+        end
+    end
+  end
+
+  defp append(held: Held, changes: list[Change]): result[Held, string] do
+    entry = record(changes)
+    written = with ok(_) <- File.write(held.path, entry, [:append, :binary]),
+         ok(_) <- File.sync(held.path) do
+      ok({})
+    else
+      error(reason) -> error(reason)
+    end
+    case written do
+      ok(_) ->
+        {values, live} = apply(held.values, held.live, changes)
+        ok(%Held{held | values: values, live: live, size: held.size + byte_size(entry)})
+      error(reason) ->
+        # Part of the record may have reached the file, and what is written
+        # after it would be lost with it, so the file is written afresh
+        # from what is in memory, which the failed write did not change.
+        rewrite(held)
+        error(reason)
+    end
+  end
+
+  # Replaces the file by one holding only what is current: written beside
+  # it, made durable, and renamed over it, so that a crash at any point
+  # leaves one whole file or the other.
+  defp rewrite(held: Held): result[Held, string] do
+    entries = Enum.map_join(Map.to_list(held.values), "", fn {key, value} ->
+      record([%Change{put: true, key: key, value: value}])
+    end)
+    fresh = @magic <> entries
+    case replace(held.path, fresh) do
+      ok(_) -> ok(%Held{held | size: byte_size(fresh)})
+      error(reason) -> error(reason)
+    end
+  end
+
+  defp replace(path: string, text: string): result[tuple[], string] do
+    beside = path <> ".compact"
+    written = with ok(_) <- File.write(beside, text, [:binary]),
+         ok(_) <- File.sync(beside),
+         ok(_) <- File.rename(beside, path),
+         ok(_) <- File.sync(Path.dirname(path)) do
+      ok({})
+    else
+      error(reason) -> error(problem(reason))
+    end
+    case written do
+      ok(_) -> ok({})
+      error(reason) ->
+        File.rm(beside)
+        error(reason)
+    end
+  end
+
+  # Reads a store's file, keeping every whole record and dropping what
+  # follows the last of them, which a crash cut short.
+  defp load(path: string, full: string): result[Held, string] do
+    read = case File.read_binary(full) do
+      ok(data) -> ok(data)
+      error(reason) ->
+        if problem(reason) == "enoent" do
+          ok("")
+        else
+          error(problem(reason))
+        end
+    end
+    case read do
+      error(reason) -> error(reason)
+      ok(data) ->
+        # A new file, or one whose first write was cut short.
+        fresh = byte_size(data) == 0 or (byte_size(data) < byte_size(@magic) and String.starts_with?(@magic, data))
+        cond do
+          fresh ->
+            made = with ok(_) <- File.write(full, @magic, [:binary]),
+                 ok(_) <- File.sync(full),
+                 ok(_) <- File.sync(Path.dirname(full)) do
+              ok({})
+            else
+              error(reason) -> error(reason)
+            end
+            case made do
+              ok(_) ->
+                ok(%Held{open: true, path: full, values: %{}, size: byte_size(@magic), live: byte_size(@magic)})
+              error(reason) -> error(problem(reason))
+            end
+          not String.starts_with?(data, @magic) -> error(path <> " is not a store")
+          true ->
+            {kept, values, live} = replay(data, byte_size(@magic), %{}, byte_size(@magic))
+            mended = if kept < byte_size(data) do
+              replace(full, binary_part(data, 0, kept))
+            else
+              ok({})
+            end
+            case mended do
+              ok(_) -> ok(%Held{open: true, path: full, values: values, size: kept, live: live})
+              error(reason) -> error(reason)
+            end
+        end
+    end
+  end
+
+  # Applies the records from a position, as long as each is whole. Gives
+  # where the last whole record ends, and the entries and their cost.
+  defp replay(data: string, at: integer, values: map[string, string], live: integer): tuple[integer, map[string, string], integer] do
+    rest = byte_size(data) - at
+    if rest < 8 do
+      {at, values, live}
+    else
+      size = Binary.decode(data, at, 4, :little)
+      if size > rest - 8 or Crypto.crc32(binary_part(data, at + 8, size)) != Binary.decode(data, at + 4, 4, :little) do
+        {at, values, live}
+      else
+        case changes(binary_part(data, at + 8, size), 0, []) do
+          none -> {at, values, live}
+          some(found) ->
+            {next, cost} = apply(values, live, found)
+            replay(data, at + 8 + size, next, cost)
+        end
+      end
+    end
+  end
+
+  # Makes changes in memory, keeping the length the file would have
+  # holding only what is current.
+  defp apply(values: map[string, string], live: integer, changes: list[Change]): tuple[map[string, string], integer] do
+    Enum.reduce(changes, {values, live}, fn change, {held, cost} ->
+      lost = case Map.fetch(held, change.key) do
+        some(old) -> cost(change.key, old)
+        none -> 0
+      end
+      if change.put do
+        {Map.put(held, change.key, change.value), cost - lost + cost(change.key, change.value)}
+      else
+        {Map.delete(held, change.key), cost - lost}
+      end
+    end)
+  end
+
+  # What one entry adds to a file holding only current entries.
+  defp cost(key: string, value: string): integer do
+    byte_size(key) + byte_size(value) + 20
+  end
+
+  defp record(changes: list[Change]): string do
+    body = Enum.map_join(changes, "", fn change ->
+      if change.put do
+        Binary.encode(1, 1, :big) <> varint(byte_size(change.key)) <> change.key <> varint(byte_size(change.value)) <> change.value
+      else
+        Binary.encode(2, 1, :big) <> varint(byte_size(change.key)) <> change.key
+      end
+    end)
+    Binary.encode(byte_size(body), 4, :little) <> Binary.encode(Crypto.crc32(body), 4, :little) <> body
+  end
+
+  # The changes of a record's body, or none when it is not one.
+  defp changes(body: string, at: integer, found: list[Change]): option[list[Change]] do
+    if at >= byte_size(body) do
+      some(Enum.reverse(found))
+    else
+      op = Binary.at(body, at)
+      case text(body, at + 1) do
+        none -> none
+        some({key, next}) ->
+          cond do
+            op == 2 -> changes(body, next, [%Change{put: false, key: key, value: ""} | found])
+            op == 1 ->
+              case text(body, next) do
+                none -> none
+                some({held, after}) ->
+                  changes(body, after, [%Change{put: true, key: key, value: held} | found])
+              end
+            true -> none
+          end
+      end
+    end
+  end
+
+  # Text behind its length, and where it ends.
+  defp text(body: string, at: integer): option[tuple[string, integer]] do
+    case uvarint(body, at, 0, 0) do
+      none -> none
+      some({size, start}) ->
+        if size > byte_size(body) - start do
+          none
+        else
+          some({binary_part(body, start, size), start + size})
+        end
+    end
+  end
+
+  defp uvarint(data: string, at: integer, shift: integer, total: integer): option[tuple[integer, integer]] do
+    if at >= byte_size(data) or shift > 56 do
+      none
+    else
+      b = Binary.at(data, at)
+      sum = total + Bitwise.bsl(Bitwise.band(b, 127), shift)
+      if b < 128 do
+        some({sum, at + 1})
+      else
+        uvarint(data, at + 1, shift + 7, sum)
+      end
+    end
+  end
+
+  defp varint(n: integer): string do
+    if n < 128 do
+      Binary.encode(n, 1, :big)
+    else
+      Binary.encode(Bitwise.bor(Bitwise.band(n, 127), 128), 1, :big) <> varint(Bitwise.bsr(n, 7))
+    end
+  end
+
+  # A file error in the words the File module uses for it.
+  defp problem(reason: string): string do
+    cond do
+      String.ends_with?(reason, "no such file or directory") -> "enoent"
+      String.ends_with?(reason, "permission denied") -> "eacces"
+      String.ends_with?(reason, "file exists") -> "eexist"
+      true -> reason
+    end
   end
 end

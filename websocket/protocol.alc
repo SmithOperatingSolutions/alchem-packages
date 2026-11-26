@@ -1,0 +1,807 @@
+defmodule WebSocketProtocol do
+  @moduledoc """
+  The WebSocket protocol of RFC 6455 without its connection: bytes that
+  arrive are given to a Protocol, which turns them into events and into the
+  bytes to answer with, and messages to send are made into frames. Use
+  WebSocket; this module is how it speaks the protocol, and WebSocket reads
+  and writes the socket.
+  """
+  import "../deflate/deflate.alc"
+  require "alchem" "v0.4.2"
+
+  # The constant RFC 6455 joins to a client's key to prove that a server
+  # understood the handshake.
+  @guid "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+  # What bounds a message unless max_message_bytes: says otherwise.
+  @default_limit 16777216
+  # Compression is permessage-deflate, RFC 7692, with each message
+  # compressed on its own: neither end carries a window from one message to
+  # the next, so a connection holds no memory for it between messages.
+  @deflate_offer "permessage-deflate; server_no_context_takeover; client_no_context_takeover"
+  # The size from which a message is compressed; deflate does little for a
+  # shorter one.
+  @deflate_from 256
+  # The bit of a frame's first byte that marks a compressed message.
+  @packed 64
+  # How long a call waits for the process that holds a protocol's state.
+  @wait 60000
+
+  @typedoc """
+  What a socket gives its reader. kind is text, binary, closed or error;
+  text is the message, the reason of a close or the failure, and code the
+  code of a close.
+  """
+  struct Event do
+    kind: string
+    text: string
+    code: integer
+  end
+
+  @typedoc """
+  A server's side of the handshake: the response to write, and whether it
+  agrees to compress.
+  """
+  struct Answer do
+    response: string
+    deflate: boolean
+  end
+
+  @typedoc """
+  A client's side of the handshake: where to connect, whether with TLS and
+  to which name, the request to write and the key it carries.
+  """
+  struct Offer do
+    address: string
+    secure: boolean
+    name: string
+    request: string
+    key: string
+  end
+
+  @typedoc """
+  What the caller that closes a socket does first: send frame, when send.
+  """
+  struct Closing do
+    frame: string
+    send: boolean
+  end
+
+  @typedoc """
+  One end of a WebSocket. It may be used by several processes at once: what
+  changes is held by a process of its own.
+  """
+  struct Protocol do
+    state: agent[State]
+    client: boolean
+    deflate: boolean
+  end
+
+  # What changes as a connection is read. pieces are bytes that do not yet
+  # make a frame, the latest first, held bytes in all, and wanted how many
+  # it takes before a frame can be read; parts are the frames so far of a
+  # message, the latest first, with size bytes in all. Text that grows is
+  # kept as lists, since adding to a string held in a struct copies it.
+  # replies are frames to write, pongs and the answer to a close, and
+  # events wait to be taken, the oldest first in both. closing is set once
+  # a close frame has been made to send, shutting once a caller has taken
+  # on closing from this end, closed once it has, and ended once the last
+  # event has been queued. active counts the events still to be sent as
+  # messages, -1 for all of them and 0 when the socket is passive; pumping
+  # is set while a process sends them.
+  struct State do
+    limit: integer
+    pieces: list[string]
+    held: integer
+    wanted: integer
+    parts: list[string]
+    size: integer
+    kind: integer
+    packed: boolean
+    replies: list[string]
+    events: list[Event]
+    closing: boolean
+    shutting: boolean
+    closed: boolean
+    ended: boolean
+    active: integer
+    pumping: boolean
+  end
+
+  # A frame read from what has arrived: not all there yet, needing more
+  # bytes from where it starts; a broken rule, with the close code that
+  # reports it; or the frame, its payload unmasked, and where the next one
+  # starts.
+  type Framed do
+    wait(need: integer)
+    bad(code: integer, text: string)
+    got(fin: boolean, op: integer, packed: boolean, payload: string, next: integer)
+  end
+
+  @doc """
+  The protocol of a connection whose handshake is done.
+  """
+  def new(client: boolean, limit: integer, deflate: boolean): Protocol do
+    bound = if limit <= 0 do
+      @default_limit
+    else
+      limit
+    end
+    state = Agent.start(fn ->
+      %State{limit: bound, pieces: [], held: 0, wanted: 0, parts: [], size: 0, kind: 0, packed: false, replies: [], events: [], closing: false, shutting: false, closed: false, ended: false, active: 0, pumping: false}
+    end)
+    %Protocol{state: state, client: client, deflate: deflate}
+  end
+
+  @doc """
+  Whether the handshake agreed to compress messages.
+  """
+  def compressed(protocol: Protocol): boolean do
+    protocol.deflate
+  end
+
+  @doc """
+  Takes bytes read from the connection, and reports whether the last event
+  has now been read.
+  """
+  def feed(protocol: Protocol, data: string): boolean do
+    Agent.get_and_update(protocol.state, fn state ->
+      cond do
+        state.ended -> {true, state}
+        state.held + byte_size(data) < state.wanted ->
+          {false, %State{state | pieces: [data | state.pieces], held: state.held + byte_size(data)}}
+        true ->
+          arrived = Enum.join(Enum.reverse([data | state.pieces]), "")
+          next = frames(protocol, %State{state | pieces: [], held: 0, wanted: 0}, arrived, 0)
+          {next.ended, next}
+      end
+    end, @wait)
+  end
+
+  @doc """
+  Is told that the connection ended, or failed with a problem, without a
+  closing handshake. It reports whether that was news.
+  """
+  def lost(protocol: Protocol, problem: string): boolean do
+    Agent.get_and_update(protocol.state, fn state ->
+      cond do
+        state.ended -> {false, state}
+        state.closed or problem == "" or problem == "closed" ->
+          {true, finish(state, %Event{kind: "closed", text: "", code: 1006})}
+        true -> {true, finish(state, %Event{kind: "error", text: problem, code: 0})}
+      end
+    end, @wait)
+  end
+
+  @doc """
+  Takes the next frame to write in answer to what was read.
+  """
+  def reply(protocol: Protocol): option[string] do
+    Agent.get_and_update(protocol.state, fn state ->
+      case state.replies do
+        [] -> {none, state}
+        [first | rest] -> {some(first), %State{state | replies: rest}}
+      end
+    end, @wait)
+  end
+
+  @doc """
+  Takes the next event.
+  """
+  def take(protocol: Protocol): option[Event] do
+    Agent.get_and_update(protocol.state, fn state ->
+      case state.events do
+        [] -> {none, state}
+        [first | rest] -> {some(first), %State{state | events: rest}}
+      end
+    end, @wait)
+  end
+
+  @doc """
+  Whether the last event has been read from the connection, whether or not
+  it has been taken.
+  """
+  def ended(protocol: Protocol): boolean do
+    Agent.get(protocol.state, fn state -> state.ended end, @wait)
+  end
+
+  @doc """
+  Whether the last event has been taken: there is nothing more to receive.
+  """
+  def drained(protocol: Protocol): boolean do
+    Agent.get(protocol.state, fn state -> state.ended and state.events == [] end, @wait)
+  end
+
+  @doc """
+  The frame of a text (op 1) or binary (op 2) message, or error("closed")
+  once the socket is closing. A message is compressed when that was agreed
+  and makes it shorter.
+  """
+  def message(protocol: Protocol, op: integer, data: string): result[string, string] do
+    if Agent.get(protocol.state, fn state -> state.closing end, @wait) do
+      error("closed")
+    else
+      small = if protocol.deflate and byte_size(data) >= @deflate_from do
+        # A flushed message is sent without the four bytes that end it.
+        flushed = Deflate.compress_flushed(data)
+        binary_part(flushed, 0, byte_size(flushed) - 4)
+      else
+        data
+      end
+      if byte_size(small) < byte_size(data) do
+        ok(encode(protocol, Bitwise.bor(op, @packed), small))
+      else
+        ok(encode(protocol, op, data))
+      end
+    end
+  end
+
+  @doc """
+  Takes on closing the socket from this end. Of several callers at once the
+  first is told to go on, with the close frame to send when none has been
+  sent, and the rest are told none, since it is closed already.
+  """
+  def shut(protocol: Protocol, code: integer, reason: string): option[Closing] do
+    Agent.get_and_update(protocol.state, fn state ->
+      cond do
+        state.shutting -> {none, state}
+        state.closing -> {some(%Closing{frame: "", send: false}), %State{state | shutting: true}}
+        true ->
+          frame = encode(protocol, 8, Binary.encode(code, 2, :big) <> reason)
+          {some(%Closing{frame: frame, send: true}), %State{state | shutting: true, closing: true}}
+      end
+    end, @wait)
+  end
+
+  @doc """
+  Is told that the connection has been closed from this end, and reports
+  whether that was news.
+  """
+  def closed(protocol: Protocol): boolean do
+    Agent.get_and_update(protocol.state, fn state -> {not state.closed, %State{state | closed: true}} end, @wait)
+  end
+
+  @doc """
+  Sets how many events are sent as messages, and reports whether a process
+  must be started to send them.
+  """
+  def activate(protocol: Protocol, count: integer): boolean do
+    Agent.get_and_update(protocol.state, fn state ->
+      if count == 0 or state.pumping do
+        {false, %State{state | active: count}}
+      else
+        {true, %State{state | active: count, pumping: true}}
+      end
+    end, @wait)
+  end
+
+  @doc """
+  Whether events are being sent as messages, in which case they are not
+  there to be received.
+  """
+  def active(protocol: Protocol): boolean do
+    Agent.get(protocol.state, fn state -> state.active != 0 or state.pumping end, @wait)
+  end
+
+  @doc """
+  Asked by the process sending events whether to go on.
+  """
+  def pumping(protocol: Protocol): boolean do
+    Agent.get_and_update(protocol.state, fn state ->
+      going = state.pumping and state.active != 0
+      {going, %State{state | pumping: going}}
+    end, @wait)
+  end
+
+  @doc """
+  Settles the count before an event is delivered, so that a receiver given
+  the last one can read passively at once, and reports whether it was the
+  last.
+  """
+  def sending(protocol: Protocol, final: boolean): boolean do
+    Agent.get_and_update(protocol.state, fn state ->
+      counted = if state.active > 0 do
+        state.active - 1
+      else
+        state.active
+      end
+      left = if final do
+        0
+      else
+        counted
+      end
+      last = left == 0
+      {last, %State{state | active: left, pumping: state.pumping and not last}}
+    end, @wait)
+  end
+
+  @doc """
+  Checks a request for a WebSocket handshake and makes the response that
+  accepts it.
+  """
+  def accept(method: string, names: list[string], values: list[string], compress: boolean): result[Answer, string] do
+    header = headers(names, values)
+    key = get(header, "sec-websocket-key")
+    decoded = case Base.decode64(key) do
+      some(bytes) -> bytes
+      none -> ""
+    end
+    cond do
+      method != "GET" -> error("not a WebSocket request: the method is " <> method)
+      not has(header, "connection", "upgrade") or not has(header, "upgrade", "websocket") ->
+        error("not a WebSocket request: no upgrade to websocket")
+      get(header, "sec-websocket-version") != "13" ->
+        error("not a WebSocket request: the version must be 13")
+      byte_size(decoded) != 16 ->
+        error("not a WebSocket request: the key is missing or malformed")
+      true ->
+        deflate = compress and deflate_offered(header)
+        extensions = if deflate do
+          "Sec-WebSocket-Extensions: " <> @deflate_offer <> "\r\n"
+        else
+          ""
+        end
+        response = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " <> accepting(key) <> "\r\n" <> extensions <> "\r\n"
+        ok(%Answer{response: response, deflate: deflate})
+    end
+  end
+
+  @doc """
+  Makes the request that opens a WebSocket to a ws:// or wss:// address.
+  The headers are sent with it, as a browser sends Cookie or a client
+  Authorization.
+  """
+  def ask(address: string, origin: string, compress: boolean, names: list[string], values: list[string]): result[Offer, string] do
+    case extra_headers(Enum.zip(names, values), "") do
+      error(reason) -> error(reason)
+      ok(extra) ->
+        case target(address) do
+          error(reason) -> error(reason)
+          ok({secure, host, hostname, port, path}) ->
+            default = if secure do
+              "443"
+            else
+              "80"
+            end
+            joined = if port == "" do
+              join_host_port(hostname, default)
+            else
+              host
+            end
+            key = Base.encode64(Crypto.strong_rand_bytes(16))
+            origin_line = if origin == "" do
+              ""
+            else
+              "Origin: " <> origin <> "\r\n"
+            end
+            compress_line = if compress do
+              "Sec-WebSocket-Extensions: " <> @deflate_offer <> "\r\n"
+            else
+              ""
+            end
+            request = "GET " <> path <> " HTTP/1.1\r\nHost: " <> host <> "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " <> key <> "\r\nSec-WebSocket-Version: 13\r\n" <> origin_line <> compress_line <> extra <> "\r\n"
+            ok(%Offer{address: joined, secure: secure, name: hostname, request: request, key: key})
+        end
+    end
+  end
+
+  @doc """
+  Checks a server's response to the handshake, given as its status line
+  and header lines, and reports whether messages are compressed.
+  """
+  def agreed(status: string, lines: list[string], key: string, compress: boolean): result[boolean, string] do
+    pairs = Enum.map(lines, fn line ->
+      case String.split(line, ":", [parts: 2]) do
+        [name, value] -> {String.trim(name), String.trim(value)}
+        _ -> {String.trim(line), ""}
+      end
+    end)
+    header = headers(Enum.map(pairs, fn {name, _} -> name end), Enum.map(pairs, fn {_, value} -> value end))
+    rest = case String.split(status, " ", [parts: 2]) do
+      [_, after] -> after
+      _ -> ""
+    end
+    if not String.starts_with?(status, "HTTP/1.1 101") or not has(header, "upgrade", "websocket") or get(header, "sec-websocket-accept") != accepting(key) do
+      error("the server did not accept the WebSocket: " <> rest)
+    else
+      # The server may use only what was offered: compression, with each of
+      # its messages compressed on its own.
+      Enum.reduce(extensions(header), ok(false), fn extension, sofar ->
+        name = Map.get(extension, "", "")
+        case sofar do
+          error(reason) -> error(reason)
+          ok(deflate) ->
+            if name != "permessage-deflate" or not compress or deflate or not Map.has_key?(extension, "server_no_context_takeover") do
+              error("the server chose an extension that was not offered: " <> name)
+            else
+              ok(true)
+            end
+        end
+      end)
+    end
+  end
+
+  # ---- Frames
+  # Reads frames from what arrived, from a position, acting on each.
+  defp frames(protocol: Protocol, state: State, data: string, start: integer): State do
+    if state.ended do
+      state
+    else
+      case frame(protocol, state, data, start) do
+        Framed.bad(code, text) -> broken(protocol, state, code, text)
+        Framed.wait(need) ->
+          rest = byte_size(data) - start
+          pieces = if rest == 0 do
+            []
+          else
+            [binary_part(data, start, rest)]
+          end
+          %State{state | pieces: pieces, held: rest, wanted: need}
+        Framed.got(fin, op, packed, payload, next) ->
+          {after, code, text} = accept_frame(protocol, state, fin, op, packed, payload)
+          if code == 0 do
+            frames(protocol, after, data, next)
+          else
+            broken(protocol, after, code, text)
+          end
+      end
+    end
+  end
+
+  # One frame from a position, its payload unmasked.
+  defp frame(protocol: Protocol, state: State, data: string, start: integer): Framed do
+    have = byte_size(data) - start
+    if have < 2 do
+      Framed.wait(2)
+    else
+      first = Binary.at(data, start)
+      second = Binary.at(data, start + 1)
+      fin = Bitwise.band(first, 128) != 0
+      op = Bitwise.band(first, 15)
+      marked = Bitwise.band(first, @packed) != 0
+      packed = marked and protocol.deflate and (op == 1 or op == 2)
+      masked = Bitwise.band(second, 128) != 0
+      short = Bitwise.band(second, 127)
+      width = cond do
+        short == 126 -> 2
+        short == 127 -> 8
+        true -> 0
+      end
+      cond do
+        Bitwise.band(first, 48) != 0 or (marked and not packed) ->
+          Framed.bad(1002, "protocol error: reserved bits are set")
+        masked == protocol.client and protocol.client ->
+          Framed.bad(1002, "protocol error: the server masked a frame")
+        masked == protocol.client ->
+          Framed.bad(1002, "protocol error: the client sent an unmasked frame")
+        have < 2 + width -> Framed.wait(2 + width)
+        true ->
+          size = if width == 0 do
+            short
+          else
+            Binary.decode(data, start + 2, width, :big)
+          end
+          head = 2 + width + if masked do
+            4
+          else
+            0
+          end
+          cond do
+            op >= 8 and (not fin or size > 125) ->
+              Framed.bad(1002, "protocol error: a control frame is fragmented or too long")
+            # A length that does not fit in 63 bits reads as negative.
+            size < 0 or size > state.limit -> Framed.bad(1009, "message too large")
+            have < head -> Framed.wait(head)
+            have - head < size -> Framed.wait(head + size)
+            true ->
+              body = binary_part(data, start + head, size)
+              payload = if masked do
+                mask(body, binary_part(data, start + 2 + width, 4))
+              else
+                body
+              end
+              Framed.got(fin, op, packed, payload, start + head + size)
+          end
+      end
+    end
+  end
+
+  # Acts on one frame: answers a ping, ends on a close, and queues a
+  # message once its last frame has come. The code is 0 when no rule was
+  # broken.
+  defp accept_frame(protocol: Protocol, state: State, fin: boolean, op: integer, packed: boolean, payload: string): tuple[State, integer, string] do
+    cond do
+      op == 8 -> peer_closed(protocol, state, payload)
+      op == 9 ->
+        {%State{state | replies: state.replies ++ [encode(protocol, 10, payload)]}, 0, ""}
+      op == 10 -> {state, 0, ""}
+      op == 1 or op == 2 ->
+        if state.kind != 0 do
+          {state, 1002, "protocol error: a message began before the last one ended"}
+        else
+          gathered(protocol, %State{state | kind: op, packed: packed, parts: [payload], size: byte_size(payload)}, fin)
+        end
+      op == 0 ->
+        if state.kind == 0 do
+          {state, 1002, "protocol error: a continuation frame without a message"}
+        else
+          gathered(protocol, %State{state | parts: [payload | state.parts], size: state.size + byte_size(payload)}, fin)
+        end
+      true -> {state, 1002, "protocol error: unknown opcode " <> Integer.to_string(op)}
+    end
+  end
+
+  # A message whose frames so far have been gathered: queued once the last
+  # has come.
+  defp gathered(protocol: Protocol, state: State, fin: boolean): tuple[State, integer, string] do
+    cond do
+      state.size > state.limit -> {state, 1009, "message too large"}
+      not fin -> {state, 0, ""}
+      true ->
+        joined = Enum.join(Enum.reverse(state.parts), "")
+        opened = if state.packed do
+          # The four bytes that end a flush, which the sender left off.
+          Deflate.decompress(joined <> Binary.from_list([0, 0, 255, 255]), state.limit)
+        else
+          ok(joined)
+        end
+        case opened do
+          error("too large") -> {state, 1009, "message too large"}
+          error(_) -> {state, 1007, "a compressed message could not be read"}
+          ok(message) ->
+            if state.kind == 1 and not String.valid?(message) do
+              {state, 1007, "a text message is not valid UTF-8"}
+            else
+              kind = if state.kind == 2 do
+                "binary"
+              else
+                "text"
+              end
+              event = %Event{kind: kind, text: message, code: 0}
+              {%State{state | events: state.events ++ [event], kind: 0, packed: false, parts: [], size: 0}, 0, ""}
+            end
+        end
+    end
+  end
+
+  # Answers the other end's close frame and ends with its code and reason.
+  defp peer_closed(protocol: Protocol, state: State, payload: string): tuple[State, integer, string] do
+    size = byte_size(payload)
+    if size == 1 do
+      {state, 1002, "protocol error: a close frame with a one-byte body"}
+    else
+      code = if size >= 2 do
+        Binary.decode(payload, 0, 2, :big)
+      else
+        1005
+      end
+      reason = if size >= 2 do
+        binary_part(payload, 2, size - 2)
+      else
+        ""
+      end
+      valid = code >= 1000 and code < 5000 and code != 1004 and code != 1005 and code != 1006 and (code < 1012 or code >= 3000)
+      if size >= 2 and (not valid or not String.valid?(reason)) do
+        {state, 1002, "protocol error: an invalid close code or reason"}
+      else
+        answered = if state.closing do
+          state
+        else
+          echo = if code == 1005 do
+            ""
+          else
+            Binary.encode(code, 2, :big)
+          end
+          %State{state | closing: true, replies: state.replies ++ [encode(protocol, 8, echo)]}
+        end
+        {finish(answered, %Event{kind: "closed", text: reason, code: code}), 0, ""}
+      end
+    end
+  end
+
+  # Ends after a broken rule, which is reported to the other end with its
+  # close code.
+  defp broken(protocol: Protocol, state: State, code: integer, text: string): State do
+    told = if state.closing do
+      state
+    else
+      %State{state | closing: true, replies: state.replies ++ [encode(protocol, 8, Binary.encode(code, 2, :big) <> text)]}
+    end
+    finish(told, %Event{kind: "error", text: text, code: 0})
+  end
+
+  # Queues the last event.
+  defp finish(state: State, last: Event): State do
+    %State{state | events: state.events ++ [last], ended: true, pieces: [], held: 0, wanted: 0, parts: [], size: 0}
+  end
+
+  # One frame, masked when this end is the client. An op with @packed set
+  # carries a compressed message.
+  defp encode(protocol: Protocol, op: integer, payload: string): string do
+    size = byte_size(payload)
+    marker = if protocol.client do
+      128
+    else
+      0
+    end
+    sized = cond do
+      size < 126 -> Binary.encode(Bitwise.bor(marker, size), 1, :big)
+      size < 65536 ->
+        Binary.encode(Bitwise.bor(marker, 126), 1, :big) <> Binary.encode(size, 2, :big)
+      true -> Binary.encode(Bitwise.bor(marker, 127), 1, :big) <> Binary.encode(size, 8, :big)
+    end
+    head = Binary.encode(Bitwise.bor(128, op), 1, :big) <> sized
+    if protocol.client do
+      key = Crypto.strong_rand_bytes(4)
+      head <> key <> mask(payload, key)
+    else
+      head <> payload
+    end
+  end
+
+  # Masks or unmasks a payload with a key of four bytes.
+  # Masks or unmasks a payload with a key of four bytes.
+  defp mask(payload: string, key: string): string do
+    keys = Binary.to_list(key)
+    {masked, _} = Enum.map_reduce(Binary.to_list(payload), keys, fn byte, [k | rest] -> {Bitwise.bxor(byte, k), rest ++ [k]} end)
+    Binary.from_list(masked)
+  end
+
+  # ---- The handshake
+  # Header lines by lower-case name, in order.
+  defp headers(names: list[string], values: list[string]): list[tuple[string, string]] do
+    Enum.map(Enum.zip(names, values), fn {name, value} -> {String.downcase(name), value} end)
+  end
+
+  defp get(header: list[tuple[string, string]], name: string): string do
+    case Enum.find(header, fn {found, _} -> found == name end) do
+      some({_, value}) -> value
+      none -> ""
+    end
+  end
+
+  # Whether a comma-separated header holds a token.
+  defp has(header: list[tuple[string, string]], name: string, token: string): boolean do
+    Enum.any?(header, fn {found, value} ->
+      found == name and Enum.any?(String.split(value, ","), fn part ->
+        String.downcase(String.trim(part)) == String.downcase(token)
+      end)
+    end)
+  end
+
+  # Sec-WebSocket-Extensions: each extension, by "" its name, with its
+  # parameters, in order.
+  defp extensions(header: list[tuple[string, string]]): list[map[string, string]] do
+    Enum.flat_map(header, fn {name, value} ->
+      if name != "sec-websocket-extensions" do
+        []
+      else
+        Enum.flat_map(String.split(value, ","), fn offer ->
+          [first | rest] = String.split(offer, ";")
+          extension = Enum.reduce(rest, %{"" => String.downcase(String.trim(first))}, fn part, found ->
+            case String.split(String.trim(part), "=", [parts: 2]) do
+              [key, setting] ->
+                Map.put(found, String.downcase(String.trim(key)), String.trim(String.trim(setting), "\""))
+              [key] -> Map.put(found, String.downcase(String.trim(key)), "")
+              _ -> found
+            end
+          end)
+          if Map.get(extension, "", "") == "" do
+            []
+          else
+            [extension]
+          end
+        end)
+      end
+    end)
+  end
+
+  # Whether a client offered compression in a form this end can give: its
+  # own window cannot be made smaller than deflate's full one.
+  defp deflate_offered(header: list[tuple[string, string]]): boolean do
+    Enum.any?(extensions(header), fn offer ->
+      Map.get(offer, "", "") == "permessage-deflate" and Enum.all?(Map.to_list(offer), fn {name, setting} ->
+        cond do
+          Enum.member?([
+            "",
+            "client_max_window_bits",
+            "server_no_context_takeover",
+            "client_no_context_takeover"
+          ], name) ->
+            true
+          name == "server_max_window_bits" -> setting == "15"
+          true -> false
+        end
+      end)
+    end)
+  end
+
+  # The Sec-WebSocket-Accept value for a key.
+  defp accepting(key: string): string do
+    Base.encode64(Crypto.hash(:sha1, key <> @guid))
+  end
+
+  # The headers a caller sends, as lines, or what is wrong with one.
+  defp extra_headers(pairs: list[tuple[string, string]], lines: string): result[string, string] do
+    case pairs do
+      [] -> ok(lines)
+      [{name, value} | rest] ->
+        cond do
+          name == "" or String.contains?(name, [" ", "\t", "\r", "\n", ":"]) or String.contains?(value, ["\r", "\n"]) ->
+            error("invalid header " <> inspect(name))
+          Enum.member?([
+            "host",
+            "upgrade",
+            "connection",
+            "sec-websocket-key",
+            "sec-websocket-version",
+            "sec-websocket-extensions"
+          ], String.downcase(name)) ->
+            error("the header " <> name <> " is set by the WebSocket handshake")
+          true -> extra_headers(rest, lines <> name <> ": " <> value <> "\r\n")
+        end
+    end
+  end
+
+  # The parts of a ws:// or wss:// address: whether it is secure, its host
+  # as written, the name and the port in it, and the path and query to ask
+  # for.
+  defp target(address: string): result[tuple[boolean, string, string, string, string], string] do
+    case String.split(address, "://", [parts: 2]) do
+      [scheme, rest] ->
+        lower = String.downcase(scheme)
+        if lower != "ws" and lower != "wss" do
+          error("a WebSocket address starts with ws:// or wss://")
+        else
+          {authority, path} = split_authority(rest)
+          host = case String.split(authority, "@") do
+            [only] -> only
+            parts -> Enum.at(Enum.reverse(parts), 0, "")
+          end
+          {hostname, port} = split_host(host)
+          if hostname == "" or not Regex.match?(~r/^[A-Za-z0-9._~:\-]+$/, hostname) or not Regex.match?(~r/^[0-9]*$/, port) do
+            error("invalid WebSocket address " <> inspect(address))
+          else
+            ok({lower == "wss", host, hostname, port, path})
+          end
+        end
+      _ -> error("a WebSocket address starts with ws:// or wss://")
+    end
+  end
+
+  # The authority of an address after its scheme, and the path and query
+  # that follow it, without a fragment.
+  defp split_authority(rest: string): tuple[string, string] do
+    unfragmented = hd(String.split(rest, "#", [parts: 2]))
+    case Regex.run(~r/^([^\/?]*)(.*)$/, unfragmented) do
+      some([_, authority, path]) ->
+        cond do
+          path == "" -> {authority, "/"}
+          String.starts_with?(path, "?") -> {authority, "/" <> path}
+          true -> {authority, path}
+        end
+      _ -> {unfragmented, "/"}
+    end
+  end
+
+  # The name and the port of a host, which may be [an IPv6 address].
+  defp split_host(host: string): tuple[string, string] do
+    case Regex.run(~r/^\[([^\]]*)\](?::(.*))?$/, host) do
+      some([_, name]) -> {name, ""}
+      some([_, name, port]) -> {name, port}
+      _ ->
+        case String.split(host, ":") do
+          [name] -> {name, ""}
+          [name, port] -> {name, port}
+          _ -> {"", ""}
+        end
+    end
+  end
+
+  defp join_host_port(name: string, port: string): string do
+    if String.contains?(name, ":") do
+      "[" <> name <> "]:" <> port
+    else
+      name <> ":" <> port
+    end
+  end
+end

@@ -22,13 +22,16 @@ jobs:
   test:
     # Every package is tested with the compiler's main branch, which is
     # where a change that breaks a package shows first, and with the latest
-    # release, which is what most people have.
+    # release, which is what most people have. A release is the native
+    # alchem its installers give, as people install it; main is built with
+    # Go, since it has no release. v0.3.10 tests the packages that still
+    # work with the releases before v0.4.2.
     name: Test (${{ matrix.os }}, Alchem ${{ matrix.alchem }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        alchem: [main, v0.3.10]
+        alchem: [main, v0.4.2, v0.3.10]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     defaults:
@@ -36,18 +39,34 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Go builds main, and the releases up to v0.3.11, written in Go,
+      # build programs with it.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: matrix.alchem == 'main' || startsWith(matrix.alchem, 'v0.3.')
         with:
           go-version: 1.27.x
           cache: false
       - name: Install the compiler
+        env:
+          ALCHEM_VERSION: ${{ matrix.alchem }}
+          ALCHEM_INSTALL_DIR: ${{ runner.temp }}/alchem
+          # The installers are taken from a release, not from the compiler's
+          # main branch; each checks what it downloads against the
+          # release's checksums.txt.
+          INSTALLERS: https://raw.githubusercontent.com/SmithOperatingSolutions/alchem/v0.4.2
         run: |
-          go install github.com/SmithOperatingSolutions/alchem/cmd/alchem@${{ matrix.alchem }}
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-      - name: Versions
-        run: |
-          go version
-          alchem version
+          if [ "$ALCHEM_VERSION" = main ]; then
+            go install github.com/SmithOperatingSolutions/alchem/cmd/alchem@main
+            echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          elif [ "$RUNNER_OS" = Windows ]; then
+            pwsh -NoProfile -Command "irm $INSTALLERS/install.ps1 | iex"
+            echo "$ALCHEM_INSTALL_DIR" >> "$GITHUB_PATH"
+          else
+            curl -fsSL "$INSTALLERS/install.sh" | sh
+            echo "$ALCHEM_INSTALL_DIR" >> "$GITHUB_PATH"
+          fi
+      - name: Version
+        run: alchem version
       - name: Packages
         id: packages
         run: |
@@ -69,12 +88,6 @@ jobs:
         # written with.
         if: matrix.alchem == 'main'
         run: alchem fmt --check .
-      - name: Go code
-        run: |
-          test -z "$(gofmt -l .)"
-          for dir in $(find . -name '*.go' -not -path './.git/*' -exec dirname {} \; | sort -u); do
-            go vet "$dir"/*.go
-          done
       - name: Check
         run: |
           for dir in ${{ steps.packages.outputs.dirs }}; do

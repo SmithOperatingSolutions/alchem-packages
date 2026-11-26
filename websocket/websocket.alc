@@ -10,8 +10,8 @@ defmodule WebSocket do
   dropped when that process ends. It can be sent to other processes and kept
   by servers; one process reads it at a time.
   """
-  import "native.alc"
-  require "alchem" "v0.3.10"
+  import "protocol.alc"
+  require "alchem" "v0.4.2"
 
   # How long one read of the connection waits: a process closing a socket
   # that another is reading waits no longer than this for its turn.
@@ -34,7 +34,7 @@ defmodule WebSocket do
   """
   struct Socket do
     conn: socket
-    protocol: WebSocketNative.Protocol
+    protocol: WebSocketProtocol.Protocol
   end
 
   @doc """
@@ -107,7 +107,7 @@ defmodule WebSocket do
   defp accept(request: HTTP.Request, limit: integer, compress: boolean): result[Socket, string] do
     names = Enum.map(request.headers, fn header -> elem(header, 0) end)
     values = Enum.map(request.headers, fn header -> elem(header, 1) end)
-    case WebSocketNative.accept(request.method, names, values, compress) do
+    case WebSocketProtocol.accept(request.method, names, values, compress) do
       error(reason) -> error(reason)
       ok(answer) ->
         case HTTP.take_over(request) do
@@ -119,7 +119,7 @@ defmodule WebSocket do
           ok(conn) ->
             case TCP.send(conn, answer.response) do
               ok(_) ->
-                ok(%Socket{conn: conn, protocol: WebSocketNative.new(false, limit, answer.deflate)})
+                ok(%Socket{conn: conn, protocol: WebSocketProtocol.new(false, limit, answer.deflate)})
               error(reason) ->
                 TCP.close(conn)
                 error(reason)
@@ -156,7 +156,7 @@ defmodule WebSocket do
     names = Enum.map(headers, fn header -> elem(header, 0) end)
     values = Enum.map(headers, fn header -> elem(header, 1) end)
     started = Time.monotonic()
-    case WebSocketNative.ask(address, setting(options, :origin), compress, names, values) do
+    case WebSocketProtocol.ask(address, setting(options, :origin), compress, names, values) do
       error(reason) -> error(reason)
       ok(offer) ->
         opened = if offer.secure do
@@ -172,7 +172,7 @@ defmodule WebSocket do
           ok(conn) ->
             case handshake(conn, offer, compress, ms, started) do
               ok(deflate) ->
-                ok(%Socket{conn: conn, protocol: WebSocketNative.new(true, 0, deflate)})
+                ok(%Socket{conn: conn, protocol: WebSocketProtocol.new(true, 0, deflate)})
               error(reason) ->
                 TCP.close(conn)
                 error(reason)
@@ -202,7 +202,7 @@ defmodule WebSocket do
     end
   end
 
-  defp handshake(conn: socket, offer: WebSocketNative.Offer, compress: boolean, ms: integer, started: integer): result[boolean, string] do
+  defp handshake(conn: socket, offer: WebSocketProtocol.Offer, compress: boolean, ms: integer, started: integer): result[boolean, string] do
     case TCP.send(conn, offer.request) do
       error(reason) -> error(reason)
       ok(_) ->
@@ -211,7 +211,7 @@ defmodule WebSocket do
           ok(status) ->
             case head(conn, ms, started, []) do
               error(reason) -> error(reason)
-              ok(lines) -> WebSocketNative.agreed(status, lines, offer.key, compress)
+              ok(lines) -> WebSocketProtocol.agreed(status, lines, offer.key, compress)
             end
         end
     end
@@ -247,7 +247,7 @@ defmodule WebSocket do
   end
 
   defp transmit(ws: Socket, op: integer, data: string): result[tuple[], string] do
-    case WebSocketNative.message(ws.protocol, op, data) do
+    case WebSocketProtocol.message(ws.protocol, op, data) do
       error(reason) -> error(reason)
       ok(frame) ->
         case TCP.send(ws.conn, frame) do
@@ -267,7 +267,7 @@ defmodule WebSocket do
   handshake gives closed(1006, "").
   """
   def recv(ws: Socket, ms: integer): result[Event, string] do
-    if WebSocketNative.active(ws.protocol) do
+    if WebSocketProtocol.active(ws.protocol) do
       error("the socket is active")
     else
       next(ws, ms, Time.monotonic())
@@ -276,12 +276,12 @@ defmodule WebSocket do
 
   defp next(ws: Socket, ms: integer, started: integer): result[Event, string] do
     answer(ws)
-    case WebSocketNative.take(ws.protocol) do
+    case WebSocketProtocol.take(ws.protocol) do
       some(event) -> ok(given(ws, event))
       none ->
         remaining = left(ms, started)
         cond do
-          WebSocketNative.ended(ws.protocol) -> error("closed")
+          WebSocketProtocol.ended(ws.protocol) -> error("closed")
           remaining == 0 -> error("timeout")
           true ->
             read(ws, remaining)
@@ -299,16 +299,16 @@ defmodule WebSocket do
       remaining
     end
     case TCP.recv(ws.conn, 0, wait) do
-      ok(data) -> WebSocketNative.feed(ws.protocol, data)
+      ok(data) -> WebSocketProtocol.feed(ws.protocol, data)
       error("timeout") -> false
-      error(reason) -> WebSocketNative.lost(ws.protocol, reason)
+      error(reason) -> WebSocketProtocol.lost(ws.protocol, reason)
     end
   end
 
   # Writes what the protocol answers by itself: pongs, and its side of a
   # closing handshake the other end began.
   defp answer(ws: Socket): boolean do
-    case WebSocketNative.reply(ws.protocol) do
+    case WebSocketProtocol.reply(ws.protocol) do
       none -> true
       some(frame) ->
         TCP.send(ws.conn, frame)
@@ -317,7 +317,7 @@ defmodule WebSocket do
   end
 
   # The event a reader is given. The last one drops the connection.
-  defp given(ws: Socket, event: WebSocketNative.Event): Event do
+  defp given(ws: Socket, event: WebSocketProtocol.Event): Event do
     case event.kind do
       "text" -> Event.text(event.text)
       "binary" -> Event.binary(event.text)
@@ -351,14 +351,14 @@ defmodule WebSocket do
   end
 
   defp finish(ws: Socket, code: integer, reason: string): boolean do
-    case WebSocketNative.shut(ws.protocol, code, reason) do
+    case WebSocketProtocol.shut(ws.protocol, code, reason) do
       none -> false
       some(closing) ->
         if closing.send do
           TCP.send(ws.conn, closing.frame)
         end
         await(ws, Time.monotonic())
-        WebSocketNative.closed(ws.protocol)
+        WebSocketProtocol.closed(ws.protocol)
         TCP.close(ws.conn)
         true
     end
@@ -369,7 +369,7 @@ defmodule WebSocket do
   defp await(ws: Socket, started: integer): boolean do
     answer(ws)
     remaining = left(1000, started)
-    if WebSocketNative.ended(ws.protocol) or remaining == 0 do
+    if WebSocketProtocol.ended(ws.protocol) or remaining == 0 do
       true
     else
       read(ws, remaining)
@@ -401,7 +401,7 @@ defmodule WebSocket do
         {:active, :false} -> 0
         _ -> raise("WebSocket.setopts: the option is active: true, :once or false")
       end
-      if WebSocketNative.activate(ws.protocol, count) do
+      if WebSocketProtocol.activate(ws.protocol, count) do
         Process.spawn(fn(self: pid[integer]): integer do
           pump(ws, to)
         end, 1)
@@ -414,19 +414,19 @@ defmodule WebSocket do
   defp pump(ws: Socket, to: pid[Event]): integer do
     answer(ws)
     cond do
-      not WebSocketNative.pumping(ws.protocol) -> 0
+      not WebSocketProtocol.pumping(ws.protocol) -> 0
       true ->
-        case WebSocketNative.take(ws.protocol) do
+        case WebSocketProtocol.take(ws.protocol) do
           some(event) ->
-            last = WebSocketNative.sending(ws.protocol, event.kind == "closed" or event.kind == "error")
+            last = WebSocketProtocol.sending(ws.protocol, event.kind == "closed" or event.kind == "error")
             if deliver(to, given(ws, event)) and not last do
               pump(ws, to)
             else
               0
             end
           none ->
-            if WebSocketNative.ended(ws.protocol) do
-              WebSocketNative.sending(ws.protocol, true)
+            if WebSocketProtocol.ended(ws.protocol) do
+              WebSocketProtocol.sending(ws.protocol, true)
               0
             else
               read(ws, -1)
@@ -461,6 +461,6 @@ defmodule WebSocket do
   upgraded with compress: and the client offered it.
   """
   def compressed?(ws: Socket): boolean do
-    WebSocketNative.compressed(ws.protocol)
+    WebSocketProtocol.compressed(ws.protocol)
   end
 end

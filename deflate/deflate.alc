@@ -1,0 +1,797 @@
+defmodule Deflate do
+  @moduledoc """
+  DEFLATE, RFC 1951: the compression inside gzip, zip, PNG and
+  permessage-deflate, as a raw stream without the gzip or zlib wrapper.
+  Data is compressed by its repetitions with codes made for it, and any
+  stream another compressor made is decompressed, up to a limit on what it
+  gives.
+
+      alx> text = String.duplicate("to be or not to be, ", 50)
+      alx> packed = Deflate.compress(text)
+      alx> byte_size(packed) < 100
+      true
+      alx> Deflate.decompress(packed) == ok(text)
+      true
+  """
+  require "alchem" "v0.4.2"
+
+  # What bounds decompressed data unless a limit is given.
+  @default_limit 16777216
+  # The longest match and the farthest back it may start.
+  @longest 258
+  @window 32768
+  # How many bits of a code are looked up at once when decoding; longer
+  # codes are read a bit at a time after that.
+  @fast 9
+  # The order in which the lengths of the code-length code are written.
+  @order [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+  # Lengths of matches: for each code from 257, the least length it stands
+  # for and how many extra bits follow it.
+  @span_base [
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    13,
+    15,
+    17,
+    19,
+    23,
+    27,
+    31,
+    35,
+    43,
+    51,
+    59,
+    67,
+    83,
+    99,
+    115,
+    131,
+    163,
+    195,
+    227,
+    258
+  ]
+  @span_extra [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+  # Distances of matches, the same way, for each code from 0.
+  @distance_base [
+    1,
+    2,
+    3,
+    4,
+    5,
+    7,
+    9,
+    13,
+    17,
+    25,
+    33,
+    49,
+    65,
+    97,
+    129,
+    193,
+    257,
+    385,
+    513,
+    769,
+    1025,
+    1537,
+    2049,
+    3073,
+    4097,
+    6145,
+    8193,
+    12289,
+    16385,
+    24577
+  ]
+  @distance_extra [
+    0,
+    0,
+    0,
+    0,
+    1,
+    1,
+    2,
+    2,
+    3,
+    3,
+    4,
+    4,
+    5,
+    5,
+    6,
+    6,
+    7,
+    7,
+    8,
+    8,
+    9,
+    9,
+    10,
+    10,
+    11,
+    11,
+    12,
+    12,
+    13,
+    13
+  ]
+
+  # The tables of match lengths and distances: the code of each length,
+  # and the base and extra bits of each code.
+  struct Codec do
+    length_code: map[integer, integer]
+    length_base: map[integer, integer]
+    length_extra: map[integer, integer]
+    distance_base: map[integer, integer]
+    distance_extra: map[integer, integer]
+  end
+
+  # Bits written so far: whole bytes in out, the last first, and count
+  # more in pending, the first of them lowest. The bytes are a list since
+  # the writer goes through Enum.reduce, where adding to a string copies it.
+  struct Writer do
+    out: list[integer]
+    pending: integer
+    count: integer
+  end
+
+  # A code to decode with: for each value of its first @fast bits, the
+  # symbol and its length, with length 0 for a longer code; and for the
+  # longer codes, how many there are of each length and the symbols in the
+  # order of their codes.
+  struct Decoder do
+    fast: map[integer, tuple[integer, integer]]
+    counts: map[integer, integer]
+    symbols: map[integer, integer]
+  end
+
+  @doc """
+  Compresses data into a whole stream, whose last block says it is the
+  last: by its repetitions, or when that gives nothing shorter, by its
+  bytes alone, each time with codes made for it.
+
+      alx> Deflate.decompress(Deflate.compress("hello, hello, hello"))
+      ok("hello, hello, hello")
+  """
+  def compress(data: string): string do
+    packed(data, true)
+  end
+
+  @doc """
+  Compresses data as a stream does when it is flushed: the block does not
+  say it is the last, and an empty stored block follows it, ending in the
+  four bytes 0, 0, 255 and 255. permessage-deflate sends a message so with
+  those four bytes left off; another flushed piece may follow.
+
+      alx> flushed = Deflate.compress_flushed("hello, hello, hello")
+      alx> Binary.to_list(binary_part(flushed, byte_size(flushed) - 4, 4))
+      [0, 0, 255, 255]
+      alx> Deflate.decompress(flushed)
+      ok("hello, hello, hello")
+  """
+  def compress_flushed(data: string): string do
+    packed(data, false)
+  end
+
+  @doc """
+  Decompresses a stream, giving at most 16 MB: error("corrupt") when it is
+  not DEFLATE and error("too large") when it would give more. The stream
+  ends at its last block, or at the end of the data after a whole block,
+  as a flushed one does.
+
+      alx> Deflate.decompress(Deflate.compress(""))
+      ok("")
+      alx> Deflate.decompress("not deflate")
+      error("corrupt")
+  """
+  def decompress(data: string): result[string, string] do
+    decompress(data, @default_limit)
+  end
+
+  @doc """
+  Decompresses a stream, giving at most limit bytes.
+
+      alx> Deflate.decompress(Deflate.compress(String.duplicate("a", 1000)), 100)
+      error("too large")
+  """
+  def decompress(data: string, limit: integer): result[string, string] do
+    blocks(codec(), data, 0, "", limit)
+  end
+
+  defp packed(data: string, last: boolean): string do
+    codec = codec()
+    matched = block(codec, matches(data), last)
+    if byte_size(matched) < byte_size(data) do
+      matched
+    else
+      literal = block(codec, literals(data, byte_size(data) - 1, []), last)
+      if byte_size(literal) < byte_size(matched) do
+        literal
+      else
+        matched
+      end
+    end
+  end
+
+  defp codec(): Codec do
+    length_base = indexed(@span_base)
+    %Codec{length_code: Map.new(Enum.map(3..258, fn span -> {span, code_of(length_base, 28, span)} end)), length_base: length_base, length_extra: indexed(@span_extra), distance_base: indexed(@distance_base), distance_extra: indexed(@distance_extra)}
+  end
+
+  # ---- Compressing
+  # The data as literals and matches, each {0, byte} or {length, distance},
+  # finding each match by the last place its first three bytes were seen.
+  defp matches(data: string): list[tuple[integer, integer]] do
+    Enum.reverse(scan(data, 0, positions(), []))
+  end
+
+  defp scan(data: string, place: integer, seen: map[integer, integer], found: list[tuple[integer, integer]]): list[tuple[integer, integer]] do
+    size = byte_size(data)
+    if place >= size do
+      found
+    else
+      if place + 3 > size do
+        scan(data, place + 1, seen, [{0, Binary.at(data, place)} | found])
+      else
+        key = Binary.decode(data, place, 2, :big) * 256 + Binary.at(data, place + 2)
+        before = Map.get(seen, key, -1)
+        span = if before >= 0 and place - before <= @window do
+          3 + same(data, before + 3, place + 3, min(@longest, size - place) - 3)
+        else
+          0
+        end
+        if span >= 3 do
+          remembered = remember(data, seen, place, min(place + span, size - 2))
+          scan(data, place + span, remembered, [{span, place - before} | found])
+        else
+          scan(data, place + 1, Map.put(seen, key, place), [{0, Binary.at(data, place)} | found])
+        end
+      end
+    end
+  end
+
+  defp positions(): map[integer, integer] do
+    %{}
+  end
+
+  # Every byte of the data as a literal.
+  defp literals(data: string, place: integer, found: list[tuple[integer, integer]]): list[tuple[integer, integer]] do
+    if place < 0 do
+      found
+    else
+      literals(data, place - 1, [{0, Binary.at(data, place)} | found])
+    end
+  end
+
+  # How many bytes from two places are the same, up to most.
+  defp same(data: string, a: integer, b: integer, most: integer): integer do
+    same_from(data, a, b, 0, most)
+  end
+
+  defp same_from(data: string, a: integer, b: integer, count: integer, most: integer): integer do
+    cond do
+      count >= most -> count
+      # Eight bytes at a time while they agree, then one at a time.
+      count + 8 <= most and binary_part(data, a + count, 8) == binary_part(data, b + count, 8) ->
+        same_from(data, a, b, count + 8, most)
+      binary_part(data, a + count, 1) == binary_part(data, b + count, 1) ->
+        same_from(data, a, b, count + 1, most)
+      true -> count
+    end
+  end
+
+  # Remembers where each three bytes from place up to stop begin.
+  defp remember(data: string, seen: map[integer, integer], place: integer, stop: integer): map[integer, integer] do
+    if place >= stop do
+      seen
+    else
+      remember(data, Map.put(seen, Binary.decode(data, place, 2, :big) * 256 + Binary.at(data, place + 2), place), place + 1, stop)
+    end
+  end
+
+  # One block with codes made for its symbols and its end. The last block
+  # is padded to a byte; any other is followed by the empty stored block of
+  # a flush.
+  defp block(codec: Codec, tokens: list[tuple[integer, integer]], last: boolean): string do
+    counted: tuple[map[integer, integer], map[integer, integer]] = {%{256 => 1}, %{}}
+    {literals, distances} = Enum.reduce(tokens, counted, fn {span, value}, {lits, dists} ->
+      if span == 0 do
+        {Map.update(lits, value, 1, fn n -> n + 1 end), dists}
+      else
+        symbol = 257 + Map.get(codec.length_code, span, 0)
+        {Map.update(lits, symbol, 1, fn n -> n + 1 end), Map.update(dists, distance_code(codec, value), 1, fn n -> n + 1 end)}
+      end
+    end)
+    # Two codes at least of each kind, so that every decoder takes them.
+    literal_lengths = lengths(enough(literals), 15)
+    distance_lengths = lengths(enough(distances), 15)
+    literal_codes = codes(literal_lengths)
+    distance_codes = codes(distance_lengths)
+    count_literals = max(257, last_used(literal_lengths, 285) + 1)
+    count_distances = max(1, last_used(distance_lengths, 29) + 1)
+    all = Enum.map(0..count_literals - 1, fn s -> Map.get(literal_lengths, s, 0) end) ++ Enum.map(0..count_distances - 1, fn s -> Map.get(distance_lengths, s, 0) end)
+    runs = run_lengths(all, [])
+    run_counts = Enum.reduce(runs, counts(), fn {symbol, _, _}, counts ->
+      Map.update(counts, symbol, 1, fn n -> n + 1 end)
+    end)
+    run_lengths_of = lengths(enough(run_counts), 7)
+    run_codes = codes(run_lengths_of)
+    count_runs = max(4, Enum.reduce(Enum.with_index(@order), 0, fn {symbol, index}, needed ->
+      if Map.get(run_lengths_of, symbol, 0) > 0 do
+        index + 1
+      else
+        needed
+      end
+    end))
+    # The last block or not (1 or 0), with codes of its own (2).
+    first = if last do
+      5
+    else
+      4
+    end
+    sizes = put(codec, put(codec, put(codec, put(codec, %Writer{out: [], pending: 0, count: 0}, first, 3), count_literals - 257, 5), count_distances - 1, 5), count_runs - 4, 4)
+    told = Enum.reduce(Enum.take(@order, count_runs), sizes, fn symbol, w -> put(codec, w, Map.get(run_lengths_of, symbol, 0), 3) end)
+    head = Enum.reduce(runs, told, fn {symbol, extra, bits}, w ->
+      put(codec, code(codec, w, run_codes, run_lengths_of, symbol), extra, bits)
+    end)
+    body = Enum.reduce(tokens, head, fn {span, value}, w ->
+      if span == 0 do
+        code(codec, w, literal_codes, literal_lengths, value)
+      else
+        index = Map.get(codec.length_code, span, 0)
+        w1 = code(codec, w, literal_codes, literal_lengths, 257 + index)
+        w2 = put(codec, w1, span - Map.get(codec.length_base, index, 0), Map.get(codec.length_extra, index, 0))
+        distance = distance_code(codec, value)
+        w3 = code(codec, w2, distance_codes, distance_lengths, distance)
+        put(codec, w3, value - Map.get(codec.distance_base, distance, 0), Map.get(codec.distance_extra, distance, 0))
+      end
+    end)
+    ended = code(codec, body, literal_codes, literal_lengths, 256)
+    if last do
+      flush(ended)
+    else
+      # An empty stored block, not the last: its head, then to a byte, then
+      # its length and the length's complement.
+      flush(put(codec, ended, 0, 3)) <> Binary.from_list([0, 0, 255, 255])
+    end
+  end
+
+  # The lengths of codes as runs: each {symbol, extra, bits}, 0 to 15 for a
+  # length, 16 to repeat the last one 3 to 6 times, 17 and 18 for 3 to 10
+  # and 11 to 138 zeros.
+  defp run_lengths(lengths: list[integer], runs: list[tuple[integer, integer, integer]]): list[tuple[integer, integer, integer]] do
+    case lengths do
+      [] -> Enum.reverse(runs)
+      [first | _] ->
+        count = run(lengths, first, 0)
+        cond do
+          first == 0 and count >= 11 ->
+            n = min(count, 138)
+            run_lengths(Enum.drop(lengths, n), [{18, n - 11, 7} | runs])
+          first == 0 and count >= 3 ->
+            n = min(count, 10)
+            run_lengths(Enum.drop(lengths, n), [{17, n - 3, 3} | runs])
+          first != 0 and count >= 4 ->
+            n = min(count - 1, 6)
+            run_lengths(Enum.drop(lengths, n + 1), [{16, n - 3, 2}, {first, 0, 0} | runs])
+          true -> run_lengths(Enum.drop(lengths, 1), [{first, 0, 0} | runs])
+        end
+    end
+  end
+
+  defp run(lengths: list[integer], value: integer, count: integer): integer do
+    case lengths do
+      [next | rest] ->
+        if next == value do
+          run(rest, value, count + 1)
+        else
+          count
+        end
+      [] -> count
+    end
+  end
+
+  defp enough(counts: map[integer, integer]): map[integer, integer] do
+    cond do
+      map_size(counts) >= 2 -> counts
+      Map.has_key?(counts, 0) -> Map.put(counts, 1, 1)
+      true -> Map.put(counts, 0, 1)
+    end
+  end
+
+  defp last_used(lengths: map[integer, integer], top: integer): integer do
+    Enum.reduce(Map.to_list(lengths), 0, fn {symbol, span}, last ->
+      if span > 0 and symbol <= top and symbol > last do
+        symbol
+      else
+        last
+      end
+    end)
+  end
+
+  # Huffman code lengths for symbols by how often each is used, none
+  # longer than most: when the code would be, the counts are halved until
+  # it is not.
+  defp lengths(counts: map[integer, integer], most: integer): map[integer, integer] do
+    made = huffman(Enum.map(Map.to_list(counts), fn {symbol, count} -> {count, [symbol]} end), %{})
+    if Enum.any?(Map.values(made), fn span -> span > most end) do
+      lengths(Map.new(Enum.map(Map.to_list(counts), fn {symbol, count} -> {symbol, max(1, div(count, 2))} end)), most)
+    else
+      made
+    end
+  end
+
+  # Joins the two least used groups until one is left; each join makes the
+  # codes of their symbols a bit longer.
+  defp huffman(groups: list[tuple[integer, list[integer]]], depth: map[integer, integer]): map[integer, integer] do
+    case Enum.sort(groups) do
+      [] -> depth
+      [{_, [only]}] ->
+        if map_size(depth) == 0 do
+          Map.put(depth, only, 1)
+        else
+          depth
+        end
+      [{_, _}] -> depth
+      [{a, first}, {b, second} | rest] ->
+        joined = first ++ second
+        deeper = Enum.reduce(joined, depth, fn symbol, d -> Map.update(d, symbol, 1, fn n -> n + 1 end) end)
+        huffman([{a + b, joined} | rest], deeper)
+    end
+  end
+
+  # The canonical codes of RFC 1951 for code lengths, each reversed so that
+  # it can be written lowest bit first.
+  defp codes(lengths: map[integer, integer]): map[integer, integer] do
+    counts = Enum.reduce(Map.values(lengths), counts(), fn span, c ->
+      if span > 0 do
+        Map.update(c, span, 1, fn n -> n + 1 end)
+      else
+        c
+      end
+    end)
+    {starts, _} = Enum.reduce(1..15, {counts(), 0}, fn bits, {s, code} ->
+      next = Bitwise.bsl(code + Map.get(counts, bits - 1, 0), 1)
+      {Map.put(s, bits, next), next}
+    end)
+    {made, _} = Enum.reduce(Map.to_list(lengths), {counts(), starts}, fn {symbol, span}, {m, s} ->
+      if span == 0 do
+        {m, s}
+      else
+        value = Map.get(s, span, 0)
+        {Map.put(m, symbol, reverse(value, span)), Map.put(s, span, value + 1)}
+      end
+    end)
+    made
+  end
+
+  defp reverse(value: integer, bits: integer): integer do
+    Enum.reduce(0..bits - 1, 0, fn i, out ->
+      Bitwise.bor(Bitwise.bsl(out, 1), Bitwise.band(Bitwise.bsr(value, i), 1))
+    end)
+  end
+
+  defp code(codec: Codec, w: Writer, codes: map[integer, integer], lengths: map[integer, integer], symbol: integer): Writer do
+    put(codec, w, Map.get(codes, symbol, 0), Map.get(lengths, symbol, 0))
+  end
+
+  # Writes the lowest bits of value, and the bytes that fills.
+  defp put(codec: Codec, w: Writer, value: integer, bits: integer): Writer do
+    if bits == 0 do
+      w
+    else
+      whole(codec, %Writer{w | pending: Bitwise.bor(w.pending, Bitwise.bsl(value, w.count)), count: w.count + bits})
+    end
+  end
+
+  defp whole(codec: Codec, w: Writer): Writer do
+    if w.count < 8 do
+      w
+    else
+      whole(codec, %Writer{out: [Bitwise.band(w.pending, 255) | w.out], pending: Bitwise.bsr(w.pending, 8), count: w.count - 8})
+    end
+  end
+
+  # What was written, the last bits padded to a byte.
+  defp flush(w: Writer): string do
+    bytes = if w.count == 0 do
+      w.out
+    else
+      [w.pending | w.out]
+    end
+    Binary.from_list(Enum.reverse(bytes))
+  end
+
+  defp distance_code(codec: Codec, distance: integer): integer do
+    code_of(codec.distance_base, 29, distance)
+  end
+
+  # The last code whose base is no more than a value.
+  defp code_of(bases: map[integer, integer], code: integer, value: integer): integer do
+    if code <= 0 or Map.get(bases, code, 0) <= value do
+      code
+    else
+      code_of(bases, code - 1, value)
+    end
+  end
+
+  defp counts(): map[integer, integer] do
+    %{}
+  end
+
+  defp indexed(values: list[integer]): map[integer, integer] do
+    Map.new(Enum.with_index(values) |> Enum.map(fn {value, index} -> {index, value} end))
+  end
+
+  # ---- Decompressing
+  #
+  # The data is read at a position in bits, and what it gives is passed
+  # along as a string that grows.
+  defp blocks(codec: Codec, data: string, place: integer, out: string, limit: integer): result[string, string] do
+    if place + 3 > 8 * byte_size(data) do
+      error("corrupt")
+    else
+      last = bits(data, place, 1)
+      kind = bits(data, place + 1, 2)
+      read = cond do
+        kind == 0 -> stored(data, place + 3, out, limit)
+        kind == 1 ->
+          symbols(codec, data, place + 3, out, fixed_literals(), fixed_distances(), limit)
+        kind == 2 -> dynamic(codec, data, place + 3, out, limit)
+        true -> error("corrupt")
+      end
+      case read do
+        error(reason) -> error(reason)
+        ok({next, grown}) ->
+          # A flushed stream ends after a whole block with the data.
+          if last == 1 or div(next + 7, 8) >= byte_size(data) do
+            ok(grown)
+          else
+            blocks(codec, data, next, grown, limit)
+          end
+      end
+    end
+  end
+
+  defp stored(data: string, place: integer, out: string, limit: integer): result[tuple[integer, string], string] do
+    start = div(place + 7, 8)
+    if start + 4 > byte_size(data) do
+      error("corrupt")
+    else
+      size = Binary.decode(data, start, 2, :little)
+      check = Binary.decode(data, start + 2, 2, :little)
+      cond do
+        size + check != 65535 -> error("corrupt")
+        start + 4 + size > byte_size(data) -> error("corrupt")
+        byte_size(out) + size > limit -> error("too large")
+        true -> ok({8 * (start + 4 + size), out <> binary_part(data, start + 4, size)})
+      end
+    end
+  end
+
+  defp dynamic(codec: Codec, data: string, place: integer, out: string, limit: integer): result[tuple[integer, string], string] do
+    count_literals = bits(data, place, 5) + 257
+    count_distances = bits(data, place + 5, 5) + 1
+    count_runs = bits(data, place + 10, 4) + 4
+    start = place + 14
+    run_lengths = Map.new(Enum.with_index(Enum.take(@order, count_runs)) |> Enum.map(fn {symbol, index} -> {symbol, bits(data, start + 3 * index, 3)} end))
+    if count_literals > 286 or count_distances > 30 do
+      error("corrupt")
+    else
+      case decoder(run_lengths, 19) do
+        none -> error("corrupt")
+        some(runs) ->
+          case code_lengths(data, start + 3 * count_runs, runs, count_literals + count_distances, []) do
+            none -> error("corrupt")
+            some({lengths, next}) ->
+              literal_lengths = Map.new(Enum.with_index(Enum.take(lengths, count_literals)) |> Enum.map(fn {span, symbol} -> {symbol, span} end))
+              distance_lengths = Map.new(Enum.with_index(Enum.drop(lengths, count_literals)) |> Enum.map(fn {span, symbol} -> {symbol, span} end))
+              if Map.get(literal_lengths, 256, 0) == 0 do
+                error("corrupt")
+              else
+                case {decoder(literal_lengths, 286), decoder(distance_lengths, 30)} do
+                  {some(literals), some(distances)} ->
+                    symbols(codec, data, next, out, literals, distances, limit)
+                  _ -> error("corrupt")
+                end
+              end
+          end
+      end
+    end
+  end
+
+  # The lengths of the literal and distance codes, written as runs.
+  defp code_lengths(data: string, place: integer, runs: Decoder, wanted: integer, found: list[integer]): option[tuple[list[integer], integer]] do
+    have = length(found)
+    cond do
+      have == wanted -> some({Enum.reverse(found), place})
+      have > wanted -> none
+      place > 8 * byte_size(data) -> none
+      true ->
+        {symbol, used} = decode(data, place, runs)
+        next = place + used
+        cond do
+          symbol < 0 -> none
+          symbol < 16 -> code_lengths(data, next, runs, wanted, [symbol | found])
+          symbol == 16 ->
+            case found do
+              [] -> none
+              [previous | _] ->
+                code_lengths(data, next + 2, runs, wanted, List.duplicate(previous, 3 + bits(data, next, 2)) ++ found)
+            end
+          symbol == 17 ->
+            code_lengths(data, next + 3, runs, wanted, List.duplicate(0, 3 + bits(data, next, 3)) ++ found)
+          true ->
+            code_lengths(data, next + 7, runs, wanted, List.duplicate(0, 11 + bits(data, next, 7)) ++ found)
+        end
+    end
+  end
+
+  # Literals and matches up to the end of the block.
+  defp symbols(codec: Codec, data: string, place: integer, out: string, literals: Decoder, distances: Decoder, limit: integer): result[tuple[integer, string], string] do
+    if place > 8 * byte_size(data) do
+      error("corrupt")
+    else
+      size = byte_size(out)
+      {symbol, used} = decode(data, place, literals)
+      next = place + used
+      cond do
+        symbol < 0 -> error("corrupt")
+        symbol < 256 ->
+          if size >= limit do
+            error("too large")
+          else
+            symbols(codec, data, next, out <> Binary.encode(symbol, 1, :big), literals, distances, limit)
+          end
+        symbol == 256 -> ok({next, out})
+        symbol > 285 -> error("corrupt")
+        true ->
+          index = symbol - 257
+          extra = Map.get(codec.length_extra, index, 0)
+          span = Map.get(codec.length_base, index, 0) + bits(data, next, extra)
+          {code, width} = decode(data, next + extra, distances)
+          if code < 0 or code > 29 do
+            error("corrupt")
+          else
+            more = Map.get(codec.distance_extra, code, 0)
+            from = next + extra + width
+            distance = Map.get(codec.distance_base, code, 0) + bits(data, from, more)
+            cond do
+              distance > size -> error("corrupt")
+              size + span > limit -> error("too large")
+              true ->
+                piece = binary_part(out, size - distance, min(distance, span))
+                copied = if distance >= span do
+                  piece
+                else
+                  binary_part(String.duplicate(piece, div(span, distance) + 1), 0, span)
+                end
+                symbols(codec, data, from + more, out <> copied, literals, distances, limit)
+            end
+          end
+      end
+    end
+  end
+
+  # The value of count bits from a position, the first lowest.
+  defp bits(data: string, place: integer, count: integer): integer do
+    if count == 0 do
+      0
+    else
+      Bitwise.band(peek(data, place), Bitwise.bsl(1, count) - 1)
+    end
+  end
+
+  # At least seventeen bits from a position, zeros past the end.
+  defp peek(data: string, place: integer): integer do
+    first = div(place, 8)
+    size = byte_size(data)
+    one = if first < size do
+      Binary.at(data, first)
+    else
+      0
+    end
+    two = if first + 1 < size do
+      Binary.at(data, first + 1)
+    else
+      0
+    end
+    three = if first + 2 < size do
+      Binary.at(data, first + 2)
+    else
+      0
+    end
+    Bitwise.bsr(Bitwise.bor(one, Bitwise.bor(Bitwise.bsl(two, 8), Bitwise.bsl(three, 16))), rem(place, 8))
+  end
+
+  # The next symbol and how many bits its code took, or {-1, 0} when the
+  # bits are no code.
+  defp decode(data: string, place: integer, decoder: Decoder): tuple[integer, integer] do
+    word = peek(data, place)
+    case Map.fetch(decoder.fast, Bitwise.band(word, Bitwise.bsl(1, @fast) - 1)) do
+      some(found) -> found
+      none -> slow(decoder, word, 1, 0, 0, 0)
+    end
+  end
+
+  # A code read a bit at a time, by the counts of codes of each length.
+  defp slow(decoder: Decoder, word: integer, span: integer, code: integer, first: integer, index: integer): tuple[integer, integer] do
+    if span > 15 do
+      {-1, 0}
+    else
+      value = Bitwise.bor(code, Bitwise.band(Bitwise.bsr(word, span - 1), 1))
+      count = Map.get(decoder.counts, span, 0)
+      if value - first < count do
+        {Map.get(decoder.symbols, index + value - first, -1), span}
+      else
+        slow(decoder, word, span + 1, Bitwise.bsl(value, 1), Bitwise.bsl(first + count, 1), index + count)
+      end
+    end
+  end
+
+  # The decoder for code lengths of symbols below top, or none when the
+  # lengths are not a code.
+  defp decoder(lengths: map[integer, integer], top: integer): option[Decoder] do
+    used = Enum.filter(Map.to_list(lengths), fn {symbol, span} -> span > 0 and symbol < top end)
+    counts = Enum.reduce(used, counts(), fn {_, span}, c -> Map.update(c, span, 1, fn n -> n + 1 end) end)
+    # More codes of a length than there is room for is not a code.
+    over = Enum.reduce_while(1..15, 1, fn bits, left ->
+      after = 2 * left - Map.get(counts, bits, 0)
+      if after < 0 do
+        halt(-1)
+      else
+        cont(after)
+      end
+    end)
+    if over < 0 do
+      none
+    else
+      ordered = Enum.sort(Enum.map(used, fn {symbol, span} -> {span, symbol} end))
+      symbols = Map.new(Enum.with_index(ordered) |> Enum.map(fn {{_, symbol}, index} -> {index, symbol} end))
+      codes = codes(Map.new(used))
+      blank: map[integer, tuple[integer, integer]] = %{}
+      fast = Enum.reduce(used, blank, fn {symbol, span}, table ->
+        if span > @fast do
+          table
+        else
+          code = Map.get(codes, symbol, 0)
+          Enum.reduce(0..Bitwise.bsl(1, @fast - span) - 1, table, fn high, t ->
+            Map.put(t, Bitwise.bor(code, Bitwise.bsl(high, span)), {symbol, span})
+          end)
+        end
+      end)
+      some(%Decoder{fast: fast, counts: counts, symbols: symbols})
+    end
+  end
+
+  defp fixed_literals(): Decoder do
+    lengths = Map.new(Enum.map(0..287, fn symbol ->
+      cond do
+        symbol < 144 -> {symbol, 8}
+        symbol < 256 -> {symbol, 9}
+        symbol < 280 -> {symbol, 7}
+        true -> {symbol, 8}
+      end
+    end))
+    case decoder(lengths, 288) do
+      some(d) -> d
+      none -> %Decoder{fast: %{}, counts: %{}, symbols: %{}}
+    end
+  end
+
+  defp fixed_distances(): Decoder do
+    case decoder(Map.new(Enum.map(0..29, fn symbol -> {symbol, 5} end)), 30) do
+      some(d) -> d
+      none -> %Decoder{fast: %{}, counts: %{}, symbols: %{}}
+    end
+  end
+end
