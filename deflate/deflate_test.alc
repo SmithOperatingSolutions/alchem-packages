@@ -1,0 +1,72 @@
+defmodule DeflateTest do
+  import "deflate.alc"
+  doctest Deflate
+
+  def rows(): string do
+    Enum.map_join(0..39, "", fn i -> "row #{i}: name,price,qty\n" end)
+  end
+
+  def words(): string do
+    String.duplicate("alpha beta gamma delta ", 30)
+  end
+
+  def round_trip?(data: string): boolean do
+    Deflate.decompress(Deflate.compress(data)) == ok(data) and Deflate.decompress(Deflate.compress_flushed(data)) == ok(data)
+  end
+
+  test "what is compressed comes back" do
+    noise = Crypto.strong_rand_bytes(3000)
+    long = String.duplicate(Base.encode64(Crypto.strong_rand_bytes(20000)), 2)
+    Enum.each([
+      "",
+      "a",
+      "short",
+      rows(),
+      words(),
+      noise,
+      long,
+      String.duplicate("é", 300),
+      String.duplicate("a", 70000)
+    ], fn data ->
+      assert(round_trip?(data))
+    end)
+  end
+
+  test "repetitive data shrinks, and data that cannot does not grow much" do
+    assert(byte_size(Deflate.compress(rows())) < byte_size(rows()) / 4)
+    assert(byte_size(Deflate.compress(String.duplicate("a", 70000))) < 200)
+    # Few distinct bytes take fewer bits each, even without repetitions.
+    token = Base.encode16(Crypto.strong_rand_bytes(300))
+    assert(byte_size(Deflate.compress(token)) < 400)
+    noise = Crypto.strong_rand_bytes(3000)
+    assert(byte_size(Deflate.compress(noise)) < 3100)
+  end
+
+  # Streams another compressor made: zlib, raw, at the settings named.
+  test "streams from zlib" do
+    assert(Deflate.decompress(Base.decode16!("75D2310E82400044D19E5370000A664650B90D211416806E4C8CB7D79EBFEDEF5E66CAF169FBA9DDE76DED9EE5B1ACDDEBFD6DCABF0AABB106EB05EB8075C47AC57AC37A674505C73A314FEC1303C54231516C1423C54AB3D2950D5969569A9566A55969569A956665581956A6725556869561655819568695392B7F")) == ok(rows()))
+    assert(Deflate.decompress(Base.decode16!("2BCA2F5730B052C84BCC4DD52928CA4C4ED5292CA9E42A028A1A621535C22A6A8C55D404ABA829565133ACA2E658452DB08A5A62F7050ECF61F79D2176EF1962F79F21760F1A62F7A121762F1A62F7A321764F1A62F7A511765F1AE18843ECBE34C2EE4B23ECBE34C2EE4B23ECBE34C2EE4B23ECBE34C2EE4B63ECBE34C6EE4B631C4915BB2F8DB1FBD218BB2F8DB1FBD218BB2F8DB1FBD218D39700")) == ok(rows()))
+    assert(Deflate.decompress(Base.decode16!("011300ECFF68656C6C6F2C2073746F72656420626C6F636B")) == ok("hello, stored block"))
+    huffman = "05C1C10900400803C156D2DA8A723E22F8B07F6E066FA3A8438F1994E543781B451D7ACCA02C1FC2DB28EAD0630665F910DE4651871E3328CB87F0368A3AF49841593E84B751D4A1C70CCAF221BC8DA20E3D6650960FE16D1475E83183B27C086FA3A8438F1994E543781B451D7ACCA02C1FC2DB28EAD0630665F910DE4651871E3328CB87F0368A3AF49841593E84B751D4A1C70CCAF221BC8DA20E3D6650960FE16D1475E83183B27C086FA3A8438F1994E543781B451D7ACCA02C1FC2DB28EAD0630665F910DE4651871E3328CB87F0368A3AF49841593E84B751D4A1C70CCAF221BC8DA20E3D6650960FE16D1475E83183B27C086FA3A8438F1994E543781B451D7ACCA02C1FC2DB28EAD0630665F910DE4651871E3328CB87F0368A3AF49841593E84B751D4A1C70CCAF2A10F"
+    assert(Deflate.decompress(Base.decode16!(huffman)) == ok(words()))
+    # Flushed, as permessage-deflate and a stream that is still open send it.
+    assert(Deflate.decompress(Base.decode16!("4ACC29C84854484A2D4954484FCCCD4D544849CD01B213478547C36470260800000000FFFF")) == ok(words()))
+  end
+
+  test "what is not a stream, or is cut short, is corrupt" do
+    packed = Deflate.compress(rows())
+    assert(Deflate.decompress("") == error("corrupt"))
+    assert(Deflate.decompress(Base.decode16!("FFFFFFFF")) == error("corrupt"))
+    assert(Deflate.decompress(binary_part(packed, 0, byte_size(packed) - 5)) == error("corrupt"))
+    # A stored block whose length and complement disagree.
+    assert(Deflate.decompress(Base.decode16!("011300EDFF68656C6C6F")) == error("corrupt"))
+  end
+
+  test "the limit is on what a stream gives" do
+    bomb = Deflate.compress(String.duplicate("a", 100000))
+    assert(byte_size(bomb) < 300)
+    assert(Deflate.decompress(bomb, 99999) == error("too large"))
+    assert(Deflate.decompress(bomb, 100000) == ok(String.duplicate("a", 100000)))
+    assert(Deflate.decompress(Base.decode16!("011300ECFF68656C6C6F2C2073746F72656420626C6F636B"), 5) == error("too large"))
+  end
+end
